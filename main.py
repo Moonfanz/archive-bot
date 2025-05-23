@@ -51,13 +51,14 @@ bot_log = setup_logging()
 # --- 自定义数据类 ---
 class GuildArchiveSettings:
     """封装单个服务器的归档设置"""
-    def __init__(self, guild_id: int, config_name: str, monitoring_channel_ids: list[int],
+    def __init__(self, guild_id: int, config_name: str, only_archive_monitored_channels: bool, monitoring_channel_ids: list[int],
                  archive_category_id: int, inactivity_days: int, notification_thread_id: int,
                  max_active_posts: int,
                  max_active_threads: int,
                  last_notice_message_id: int | None = None):
         self.guild_id = guild_id
         self.config_name = config_name
+        self.only_archive_monitored_channels = False
         self.monitoring_channel_ids = monitoring_channel_ids
         self.archive_category_id = archive_category_id
         self.inactivity_days = inactivity_days
@@ -70,6 +71,7 @@ class GuildArchiveSettings:
         """将设置转换为字典以便保存到JSON"""
         return {
             "guild_id": self.guild_id,
+            "only_archive_monitored_channels": self.only_archive_monitored_channels,
             "monitoring_channel_ids": self.monitoring_channel_ids,
             "archive_category_id": self.archive_category_id,
             "inactivity_days": self.inactivity_days,
@@ -85,6 +87,7 @@ class GuildArchiveSettings:
         return cls(
             guild_id=guild_id,
             config_name=config_name,
+            only_archive_monitored_channels=data.get("only_archive_monitored_channels", False),
             monitoring_channel_ids=data.get("monitoring_channel_ids", []),
             archive_category_id=data.get("archive_category_id"),
             inactivity_days=data.get("inactivity_days"),
@@ -105,9 +108,9 @@ class ThreadMessage:
     """
     自定义对象: 储存帖子对象 thread 和最后一条消息对象 last_message
     """
-    def __init__(self, thread: discord.Thread, last_message: discord.Message | ErrorMessage): #
-        self.thread = thread #
-        self.last_message = last_message #
+    def __init__(self, thread: discord.Thread, last_message: discord.Message | ErrorMessage):
+        self.thread = thread
+        self.last_message = last_message
 
 # --- 机器人核心类 ---
 class ThreadArchiverBot(commands.Bot):
@@ -288,8 +291,13 @@ class ThreadArchiverBot(commands.Bot):
         global_start_time = time.time()
         overall_summary_embed_description += f"> 基于不活跃天数的归档：**{'开启' if settings.inactivity_days > 0 else '关闭'}**\n"
         initial_log_info += f"基于不活跃天数的归档: {'开启' if settings.inactivity_days > 0 else '关闭'}\n"
-        overall_summary_embed_description += f"> 正在监控 **{len(settings.monitoring_channel_ids)}** 个频道\n"
-        initial_log_info += f"正在监控 {len(settings.monitoring_channel_ids)} 个频道\n"
+        if settings.only_archive_monitored_channels:
+            overall_summary_embed_description += f"> 仅归档 **{len(settings.monitoring_channel_ids)}** 个频道\n"
+            overall_summary_embed_description += f"> 正在监控 **{len(settings.monitoring_channel_ids)}** 个频道\n"
+            initial_log_info += f"正在监控 {len(settings.monitoring_channel_ids)} 个频道\n"
+        else: 
+            overall_summary_embed_description += f"> 正在监控 **所有频道**\n"
+
         overall_summary_embed_description += "\n"
 
         if manual:
@@ -344,15 +352,25 @@ class ThreadArchiverBot(commands.Bot):
             initial_log_info += f"\n服务器级需归档数量: {kill_count_server_level}。开始筛选候选帖子..."
 
             candidate_threads_for_server_kill = []
-            monitored_parent_ids_set = set(settings.monitoring_channel_ids)
 
-            for thread_obj in all_server_active_threads_list:
-                if thread_obj.id not in pinned_threads_set_server_wide and \
-                   thread_obj.parent_id in monitored_parent_ids_set and \
-                   not thread_obj.locked:
-                    candidate_threads_for_server_kill.append(thread_obj)
+            if settings.only_archive_monitored_channels:
+                monitored_parent_ids_set = set(settings.monitoring_channel_ids)
 
-            initial_log_info += f"\n  来自监控频道的、非置顶、非锁定的候选帖子数: {len(candidate_threads_for_server_kill)}"
+                for thread_obj in all_server_active_threads_list:
+                    if thread_obj.id not in pinned_threads_set_server_wide and \
+                    thread_obj.parent_id in monitored_parent_ids_set and \
+                    not thread_obj.locked:
+                        candidate_threads_for_server_kill.append(thread_obj)
+
+                initial_log_info += f"\n  来自监控频道的、非置顶、非锁定的候选帖子数: {len(candidate_threads_for_server_kill)}"
+
+            else:
+                for thread_obj in all_server_active_threads_list:
+                    if thread_obj.id not in pinned_threads_set_server_wide and \
+                    not thread_obj.locked:
+                        candidate_threads_for_server_kill.append(thread_obj)
+
+                initial_log_info += f"\n  非置顶、非锁定的候选帖子数: {len(candidate_threads_for_server_kill)}"
 
             if candidate_threads_for_server_kill:
                 get_msg_start = time.time()
@@ -486,11 +504,11 @@ class ThreadArchiverBot(commands.Bot):
                     await notif_channel.send(embed=final_embed)
 
                     if self.log_get_message_error_details:
-                        error_embed = Embed(title=f"警告: 获取消息出错 (索引: {run_hash_value})", description=self.log_get_message_error_details[:4000], color=Color.yellow())
+                        error_embed = Embed(title=f"警告: 获取消息出错↓", description=self.log_get_message_error_details[:4000], color=Color.yellow())
                         await notif_channel.send(embed=error_embed)
 
                     if self.log_archived_error_details:
-                        error_embed = Embed(title=f"错误: 归档操作出错 (索引: {run_hash_value})", description=self.log_archived_error_details[:4000], color=Color.red())
+                        error_embed = Embed(title=f"错误: 归档操作出错↓", description=self.log_archived_error_details[:4000], color=Color.red())
                         await notif_channel.send(embed=error_embed)
 
             except Exception as e:
@@ -523,22 +541,22 @@ class ThreadArchiverBot(commands.Bot):
 
             # 如果循环结束没有找到消息
             self.not_found_error_count += 1
-            error_detail = f"\n  - 帖子 {thread.mention} (ID:{thread.id}): 未能从 history() 获取到消息。"
+            error_detail = f"\n  > 帖子 {thread.mention} 中未能找到消息"
 
             self.log_get_message_error_details += error_detail #
-            bot_log.warning(f"获取帖子 {thread.name} (ID:{thread.id}) 的最后消息失败: history()迭代未返回消息。")
+            bot_log.warning(f"获取帖子 {thread.name} (ID:{thread.id}) 的最后消息失败: history()迭代未返回消息")
             return ErrorMessage(thread.created_at) #
 
         except discord.Forbidden:
             self.not_found_error_count += 1
-            error_detail = f"\n  - 帖子 {thread.mention} (ID:{thread.id}): 无权限访问历史记录 (Forbidden)。"
+            error_detail = f"\n  > 帖子 {thread.mention} 无权限访问其历史记录"
             self.log_get_message_error_details += error_detail
             bot_log.warning(f"获取帖子 {thread.name} (ID:{thread.id}) 的最后消息失败: 无权限(Forbidden)。")
             return ErrorMessage(thread.created_at)
 
         except Exception as e:
             self.not_found_error_count += 1
-            error_detail = f"\n  - 帖子 {thread.mention} (ID:{thread.id}): 获取消息时发生错误: {e}"
+            error_detail = f"\n  > 帖子 {thread.mention} 获取其消息时发生错误↙\n{e}"
             self.log_get_message_error_details += error_detail
             bot_log.error(f"获取帖子 {thread.name} (ID:{thread.id}) 的最后消息时发生异常: {e}", exc_info=False)
             return ErrorMessage(thread.created_at)
@@ -592,7 +610,7 @@ class ThreadArchiverBot(commands.Bot):
                 embed_title_key = f"[T{self.succeed_count}] 归档成功↓"
                 embed_value_desc = f"> {thread.mention}\n> 最后活跃时间: {last_message_time_str} ({days_diff_str})"
 
-                if len(self.archive_run_details_for_embed) < 10: #只保留前十条
+                if len(self.archive_run_details_for_embed) < 10:
                     self.archive_run_details_for_embed[embed_title_key] = embed_value_desc #
 
         except Exception as e:
