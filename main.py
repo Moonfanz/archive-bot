@@ -289,8 +289,8 @@ class ThreadArchiverBot(commands.Bot):
         initial_log_info = ""
         overall_summary_embed_description = ""
         global_start_time = time.time()
-        overall_summary_embed_description += f"> 基于不活跃天数的归档：**{'开启' if settings.inactivity_days > 0 else '关闭'}**\n"
-        initial_log_info += f"基于不活跃天数的归档: {'开启' if settings.inactivity_days > 0 else '关闭'}\n"
+        overall_summary_embed_description += f"> 不活跃 **{settings.inactivity_days}** 天归档：**{'开启' if settings.inactivity_days > 0 else '关闭'}**\n"
+        initial_log_info += f"> 不活跃 **{settings.inactivity_days}** 天归档: {'开启' if settings.inactivity_days > 0 else '关闭'}\n"
         if settings.only_archive_monitored_channels:
             overall_summary_embed_description += f"> 仅归档 **{len(settings.monitoring_channel_ids)}** 个频道\n"
             overall_summary_embed_description += f"> 正在监控 **{len(settings.monitoring_channel_ids)}** 个频道\n"
@@ -301,10 +301,10 @@ class ThreadArchiverBot(commands.Bot):
         overall_summary_embed_description += "\n"
 
         if manual:
-            initial_log_info += f"\n[== 手动开始清理 (服务器级优先) ==] 服务器: {settings.config_name} ({guild.name}) | 日志索引: {run_hash_value}"
+            initial_log_info += f"\n<== 手动开始清理 (服务器级优先) ==> 服务器: {settings.config_name} ({guild.name}) | 日志索引: {run_hash_value}"
 
         else:
-            initial_log_info += f"\n[== 自动开始清理 (服务器级优先) ==] 服务器: {settings.config_name} ({guild.name}) | 日志索引: {run_hash_value}"
+            initial_log_info += f"\n<== 自动开始清理 (服务器级优先) ==> 服务器: {settings.config_name} ({guild.name}) | 日志索引: {run_hash_value}"
 
         initial_log_info += f"\n服务器级活跃帖目标: {settings.max_active_threads}"
         overall_summary_embed_description += f"> 服务器活跃帖目标: **{settings.max_active_threads}**\n"
@@ -338,7 +338,7 @@ class ThreadArchiverBot(commands.Bot):
                         initial_log_info += f"\n  [取消归档置顶帖失败] {thread_obj.name}: {e}"
 
         pinned_server_wide_count = len(pinned_threads_set_server_wide)
-        initial_log_info += f"\n全服务器置顶帖子数: {pinned_server_wide_count}"
+        initial_log_info += f"\n全服务器置顶帖子数: **{pinned_server_wide_count}**"
         overall_summary_embed_description += f"> 全服置顶帖: {pinned_server_wide_count}\n"
 
         # --- 步骤 3: 服务器级数量控制 ---
@@ -353,6 +353,7 @@ class ThreadArchiverBot(commands.Bot):
 
             candidate_threads_for_server_kill = []
 
+            # 只处理监控频道内的帖子
             if settings.only_archive_monitored_channels:
                 monitored_parent_ids_set = set(settings.monitoring_channel_ids)
 
@@ -364,6 +365,7 @@ class ThreadArchiverBot(commands.Bot):
 
                 initial_log_info += f"\n  来自监控频道的、非置顶、非锁定的候选帖子数: {len(candidate_threads_for_server_kill)}"
 
+            # 处理所有频道内的帖子
             else:
                 for thread_obj in all_server_active_threads_list:
                     if thread_obj.id not in pinned_threads_set_server_wide and \
@@ -414,15 +416,14 @@ class ThreadArchiverBot(commands.Bot):
                     active_threads_in_monitored_forums_for_inactivity_check.append(t_obj)
 
             if active_threads_in_monitored_forums_for_inactivity_check:
-                log_inactivity_phase += f"\n  找到 {len(active_threads_in_monitored_forums_for_inactivity_check)} 个在监控频道中的活跃、非置顶帖进行不活跃检查。"
+                log_inactivity_phase += f"\n  找到 {len(active_threads_in_monitored_forums_for_inactivity_check)} 个在监控频道中的活跃、非置顶帖进行不活跃检查"
 
                 get_msg_start_ia = time.time()
                 current_msg_succeed = self.message_succeed_count
                 current_msg_fail = self.not_found_error_count
                 thread_message_obj_list_inactivity = await self._get_last_message_task(active_threads_in_monitored_forums_for_inactivity_check)
                 get_msg_time_ia = time.time() - get_msg_start_ia
-                log_inactivity_phase += f"\n  获取不活跃检查帖子的 最后一条消息 耗时: {get_msg_time_ia:.3f}s (S:{self.message_succeed_count-current_msg_succeed}/F:{self.not_found_error_count-current_msg_fail})"
-                overall_summary_embed_description += f"-# `最后一条消息`(不活跃检查) 耗时: +{get_msg_time_ia:.3f}s\n"
+                log_inactivity_phase += f"\n  获取不活跃检查帖子的最后一条消息耗时: {get_msg_time_ia:.3f}s (S:{self.message_succeed_count-current_msg_succeed}/F:{self.not_found_error_count-current_msg_fail})"
 
                 threads_to_archive_due_to_inactivity = []
                 now_utc_naive = datetime.now(timezone.utc).replace(tzinfo=None)
@@ -434,7 +435,7 @@ class ThreadArchiverBot(commands.Bot):
                     if last_activity_naive < inactivity_threshold_date:
                         threads_to_archive_due_to_inactivity.append(tm_obj)
 
-                log_inactivity_phase += f"\n  找到 {len(threads_to_archive_due_to_inactivity)} 个帖子因不活跃需要归档。"
+                log_inactivity_phase += f"\n  找到 {len(threads_to_archive_due_to_inactivity)} 个帖子因不活跃需要归档"
 
                 if threads_to_archive_due_to_inactivity:
                     archive_task_start_time_ia = time.time()
@@ -444,7 +445,6 @@ class ThreadArchiverBot(commands.Bot):
                     threads_archived_this_run += (self.succeed_count - initial_succeed_count_ia)
                     archive_task_time_ia = time.time() - archive_task_start_time_ia
                     log_inactivity_phase += f"\n  不活跃帖子归档操作耗时: {archive_task_time_ia:.3f}s (成功:{self.succeed_count - initial_succeed_count_ia}, 失败:{self.fail_count - initial_fail_count_ia})"
-                    overall_summary_embed_description += f"-# `已归档帖子`(不活跃) 耗时: +{archive_task_time_ia:.3f}s\n"
             else:
                 log_inactivity_phase += "\n  没有在监控频道中找到需要进行不活跃检查的帖子。"
 
