@@ -152,6 +152,4 @@ BOT提供以下 Slash 命令进行管理 (需要用户拥有 `管理服务器 (M
 ## 注意事项
 
 * **权限**: 确保BOT拥有必要的权限来读取频道历史、查看帖子、管理帖子（编辑以进行归档）以及在通知频道发送消息。至少需要 `Read Message History`, `View Channels`, `Manage Threads`, `Send Messages`, `Embed Links`。
-* **`max_active_posts`**: 如前所述，虽然 `max_active_posts` 可以通过命令设置并存储在配置中，但当前版本的核心归档逻辑 (`process_guild_threads`) 并没有基于此参数对每个监控频道内的帖子数量进行主动限制。服务器级的帖子数量控制主要由 `max_active_threads` 实现。
-* **归档操作**: 当前的归档操作仅涉及将帖子的 `archived` 状态设置为 `True`。 它不会将帖子移动到 `archive_category_id` 指定的分类下，即使该ID已配置。
 * **速率限制**: 代码中包含小的延时 (`asyncio.sleep`) 以尝试避免 Discord API 的速率限制，但在非常大的服务器或非常频繁的操作下仍需注意。
