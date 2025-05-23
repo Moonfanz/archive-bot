@@ -676,7 +676,7 @@ class ArchiveManagerCog(commands.Cog):
     @app_commands.command(name="manual-guild-archive", description="手动触发对指定配置服务器的归档检查。")
     @app_commands.describe(config_name="在bot_config.json中定义的服务器配置名")
     @app_commands.checks.has_permissions(manage_guild=True)
-    async def manual_guild_archive_cmd(self, interaction: discord.Interaction, config_name: str): # (修改：传入 manual=True)
+    async def manual_guild_archive_cmd(self, interaction: discord.Interaction, config_name: str):
         await interaction.response.defer(ephemeral=True, thinking=True)
 
         target_setting: GuildArchiveSettings | None = None
