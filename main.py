@@ -52,10 +52,11 @@ bot_log = setup_logging()
 class GuildArchiveSettings:
     """封装单个服务器的归档设置"""
     def __init__(self, guild_id: int, config_name: str, only_archive_monitored_channels: bool, monitoring_channel_ids: list[int],
-                 archive_category_id: int, inactivity_days: int, notification_thread_id: int,
+                 archive_category_id: int | None, inactivity_days: int, notification_thread_id: int | None,
                  max_active_posts: int,
                  max_active_threads: int,
-                 last_notice_message_id: int | None = None):
+                 last_notice_message_id: int | None = None,
+                 pinned_thread_moderation: dict | None = None):
         self.guild_id = guild_id
         self.config_name = config_name
         self.only_archive_monitored_channels = False
@@ -66,6 +67,10 @@ class GuildArchiveSettings:
         self.max_active_posts = max_active_posts
         self.max_active_threads = max_active_threads
         self.last_notice_message_id = last_notice_message_id
+        mod_settings = pinned_thread_moderation or {}
+        self.pinned_mod_enabled = mod_settings.get("enabled", False)
+        self.allowed_role_ids = [int(role_id) for role_id in mod_settings.get("allowed_role_ids", [])]
+        self.allowed_user_ids = [int(user_id) for user_id in mod_settings.get("allowed_user_ids", [])]
 
     def to_dict(self) -> dict:
         """将设置转换为字典以便保存到JSON"""
@@ -94,7 +99,8 @@ class GuildArchiveSettings:
             notification_thread_id=data.get("notification_thread_id"),
             max_active_posts=data.get("max_active_posts"),
             max_active_threads=data.get("max_active_threads"),
-            last_notice_message_id=data.get("last_notice_message_id")
+            last_notice_message_id=data.get("last_notice_message_id"),
+            pinned_thread_moderation=data.get("pinned_thread_moderation")
         )
 
 class ErrorMessage: 
@@ -128,6 +134,10 @@ class ThreadArchiverBot(commands.Bot):
         self.operation_lock = asyncio.Lock()
 
         DATA_DIRECTORY.mkdir(exist_ok=True)
+        
+        self.BUMP_RECORDS_FILE = DATA_DIRECTORY / "pinned_thread_bump_records.json"
+        self.bump_records: dict[int, dict] = {}
+        self.bump_records_lock = asyncio.Lock()
 
         self.succeed_count = 0
         self.fail_count = 0
@@ -208,13 +218,46 @@ class ThreadArchiverBot(commands.Bot):
                 bot_log.info(f"已更新 {setting.config_name} 的通知消息ID到 {notice_id_file}")
             except Exception as e:
                 bot_log.error(f"写入 {notice_id_file} 失败: {e}", exc_info=True)
+    
+    
+    def _load_bump_records(self):
+        """同步加载刷新记录文件到内存"""
+        try:
+            with open(self.BUMP_RECORDS_FILE, 'r', encoding='utf-8') as f:
+                records_from_file = json.load(f)
+                # 将ISO格式的时间字符串转换回datetime对象
+                for thread_id, data in records_from_file.items():
+                    self.bump_records[int(thread_id)] = {
+                        "last_bumped_utc": datetime.fromisoformat(data["last_bumped_utc"])
+                    }
+                bot_log.info(f"成功从 {self.BUMP_RECORDS_FILE} 加载了 {len(self.bump_records)} 条置顶帖刷新记录。")
+        except FileNotFoundError:
+            bot_log.info(f"刷新记录文件 {self.BUMP_RECORDS_FILE} 未找到，将创建一个新的。")
+        except (json.JSONDecodeError, KeyError, TypeError) as e:
+            bot_log.error(f"加载刷新记录文件失败，文件可能已损坏: {e}", exc_info=True)
 
-
+    async def _save_bump_records(self):
+        """将内存中的刷新记录保存到文件"""
+        async with self.bump_records_lock:
+            try:
+                # 准备要写入的数据，将datetime对象转换为ISO格式的字符串
+                records_to_save = {}
+                for thread_id, data in self.bump_records.items():
+                    records_to_save[str(thread_id)] = {
+                        "last_bumped_utc": data["last_bumped_utc"].isoformat()
+                    }
+                
+                with open(self.BUMP_RECORDS_FILE, 'w', encoding='utf-8') as f:
+                    json.dump(records_to_save, f, indent=4)
+            except Exception as e:
+                bot_log.error(f"保存刷新记录到 {self.BUMP_RECORDS_FILE} 失败: {e}", exc_info=True)
+    
     async def setup_hook(self):
         """Bot启动时的异步设置"""
+        self._load_bump_records()
         await self.load_configuration()
         await self.add_cog(ArchiveManagerCog(self))
-
+    
         try:
             synced = await self.tree.sync()
             bot_log.info(f"已同步 {len(synced)} 个应用命令。")
@@ -224,12 +267,17 @@ class ThreadArchiverBot(commands.Bot):
         self.periodic_thread_audit.start()
 
     async def on_ready(self):
-        bot_log.info(f"机器人 '{self.user}' (ID: {self.user.id}) 已成功登录并准备就绪！")
+        if not self.user:
+            bot_log.error("机器人未能正确初始化 self.user。")
+            return
+            
+        bot_log.info(f"机器人 '{self.user.name}' (ID: {self.user.id}) 已成功登录并准备就绪！")
         bot_log.info(f"当前管理 {len(self.guild_settings_map)} 个服务器配置。")
 
-        main_admin_channel_id = os.environ.get("MAIN_ADMIN_CHANNEL_ID")
+        main_admin_channel_id_str = os.environ.get("MAIN_ADMIN_CHANNEL_ID")
 
-        if main_admin_channel_id:
+        if main_admin_channel_id_str and main_admin_channel_id_str.isdigit():
+            main_admin_channel_id = int(main_admin_channel_id_str)
             try:
                 channel = await self.fetch_channel(main_admin_channel_id)
 
@@ -244,6 +292,52 @@ class ThreadArchiverBot(commands.Bot):
 
             except Exception as e:
                 bot_log.error(f"发送启动通知时出错: {e}", exc_info=True)
+
+    async def on_message(self, message: discord.Message):
+        # 忽略机器人自身的消息和私信
+        if message.author.bot or not message.guild:
+            return
+
+        # 检查消息是否在帖子(Thread)中
+        if not isinstance(message.channel, discord.Thread):
+            return
+
+        thread = message.channel
+        
+        # 检查帖子是否被置顶
+        if not thread.flags.pinned:
+            return
+
+        # 获取当前服务器的配置
+        settings = self.guild_settings_map.get(message.guild.id)
+        if not settings or not settings.pinned_mod_enabled:
+            return # 如果没有配置或功能未启用，则不做任何事
+
+        # 检查用户是否在豁免名单中
+        author = message.author
+        
+        # 检查用户ID是否豁免
+        if author.id in settings.allowed_user_ids:
+            return
+            
+        # 检查用户身份组ID是否豁免
+        if isinstance(author, discord.Member):
+            author_role_ids = {role.id for role in author.roles}
+            if not author_role_ids.isdisjoint(settings.allowed_role_ids):
+                return
+        
+        # 如果用户不在豁免名单，则删除消息
+        try:
+            await message.delete()
+            bot_log.debug(f"已删除用户 {author.name} ({author.id}) 在置顶帖 '{thread.name}' 中的消息。")
+        except discord.Forbidden:
+            parent_name = thread.parent.name if thread.parent else "未知频道"
+            bot_log.warning(f"无法删除消息：缺少在频道 '{parent_name}' 中 '管理消息' 的权限。")
+        except discord.NotFound:
+            # 消息可能已经被用户自己删除了
+            pass
+        except Exception as e:
+            bot_log.error(f"删除消息时发生未知错误: {e}", exc_info=True)
 
     @tasks.loop(minutes=15)
     async def periodic_thread_audit(self):
@@ -327,20 +421,58 @@ class ThreadArchiverBot(commands.Bot):
         # --- 步骤 2: 置顶帖处理 (全服务器范围) ---
         pinned_threads_set_server_wide = set()
         initial_log_info += f"\n置顶帖处理 (全服务器):"
+        now_utc = datetime.now(timezone.utc)
+        # 48 小时前的刷新操作已经可能失效
+        self_trust_duration = timedelta(hours=48)
+
         for thread_obj in all_server_active_threads_list:
-            if thread_obj.flags.pinned:
-                pinned_threads_set_server_wide.add(thread_obj.id)
+            if not thread_obj.flags.pinned:
+                continue # 只处理置顶帖
+
+            pinned_threads_set_server_wide.add(thread_obj.id)
+            
+            try:
+                # 如果帖子意外被归档，立即激活
                 if thread_obj.archived:
-                    try:
-                        await thread_obj.edit(archived=False, reason="确保置顶帖活跃 (服务器级检查)")
-                        initial_log_info += f"\n  [已取消归档置顶帖] {thread_obj.name} (位于: {thread_obj.parent.name if thread_obj.parent else '未知频道'})"
-                    except Exception as e:
-                        initial_log_info += f"\n  [取消归档置顶帖失败] {thread_obj.name}: {e}"
+                    await thread_obj.edit(archived=False, reason="[保活] 发现已归档的置顶帖，进行激活")
+                    initial_log_info += f"\n  [已取消置顶帖归档] {thread_obj.name} (ID: {thread_obj.id})"
+                    continue
+
+                # 检查内存中的持久化记录
+                record = self.bump_records.get(thread_obj.id)
+                if record and (now_utc - record["last_bumped_utc"] < self_trust_duration):
+                    # 如果我们在48小时内刷新过它，就跳过它，不进行刷新
+                    continue
+
+                # 执行保活操作
+                reason_for_bump = "记录不存在" if not record else "记录已过期"
+                initial_log_info += f"\n  [需要保活] {thread_obj.name} (原因: {reason_for_bump})。"
+                
+                action_taken = False
+                if not thread_obj.locked:
+                    temp_message = await thread_obj.send(f"置顶帖保活，稍后删除")
+                    await temp_message.delete()
+                    action_taken = True
+                    initial_log_info += f" -> 已通过消息刷新。"
+                else:
+                    await thread_obj.edit(locked=True, reason="[保活] 刷新锁定的置顶帖活跃度")
+                    action_taken = True
+                    initial_log_info += f" -> 已通过Edit刷新。"
+                
+                # 更新内存记录并异步保存到文件
+                if action_taken:
+                    self.bump_records[thread_obj.id] = { "last_bumped_utc": now_utc }
+                    await self._save_bump_records()
+                    initial_log_info += f" 等待4秒..."
+                    await asyncio.sleep(4) # 为防止API速率限制，在每次成功刷新后等待
+
+            except Exception as e:
+                initial_log_info += f"\n  [保活失败] 处理 {thread_obj.name} 时发生未知错误: {e}"
 
         pinned_server_wide_count = len(pinned_threads_set_server_wide)
         initial_log_info += f"\n全服务器置顶帖子数: **{pinned_server_wide_count}**"
         overall_summary_embed_description += f"> 全服置顶帖: {pinned_server_wide_count}\n"
-
+        
         # --- 步骤 3: 服务器级数量控制 ---
         kill_count_server_level = current_total_server_threads - settings.max_active_threads
         initial_log_info += f"\n计算服务器级归档数: (总活跃 {current_total_server_threads}) - (目标 {settings.max_active_threads}) = {kill_count_server_level}"
@@ -545,21 +677,21 @@ class ThreadArchiverBot(commands.Bot):
 
             self.log_get_message_error_details += error_detail #
             bot_log.warning(f"获取帖子 {thread.name} (ID:{thread.id}) 的最后消息失败: history()迭代未返回消息")
-            return ErrorMessage(thread.created_at) #
+            return ErrorMessage(thread.created_at or datetime.now(timezone.utc))
 
         except discord.Forbidden:
             self.not_found_error_count += 1
             error_detail = f"\n  > 帖子 {thread.mention} 无权限访问其历史记录"
             self.log_get_message_error_details += error_detail
             bot_log.warning(f"获取帖子 {thread.name} (ID:{thread.id}) 的最后消息失败: 无权限(Forbidden)。")
-            return ErrorMessage(thread.created_at)
+            return ErrorMessage(thread.created_at or datetime.now(timezone.utc))
 
         except Exception as e:
             self.not_found_error_count += 1
             error_detail = f"\n  > 帖子 {thread.mention} 获取其消息时发生错误↙\n{e}"
             self.log_get_message_error_details += error_detail
             bot_log.error(f"获取帖子 {thread.name} (ID:{thread.id}) 的最后消息时发生异常: {e}", exc_info=False)
-            return ErrorMessage(thread.created_at)
+            return ErrorMessage(thread.created_at or datetime.now(timezone.utc))
 
     async def _archive_thread_task(self, thread_obj_list: list[ThreadMessage], settings: GuildArchiveSettings): #
         tasks_list = []
@@ -575,7 +707,8 @@ class ThreadArchiverBot(commands.Bot):
         archive_reason = f"自动归档"
 
         if isinstance(last_msg_obj, ErrorMessage):
-            last_message_time_str = f"未知(帖子创建于 {thread.created_at.strftime('%Y-%m-%d %H:%M')})"
+            created_at_str = thread.created_at.strftime('%Y-%m-%d %H:%M') if thread.created_at else "未知时间"
+            last_message_time_str = f"未知(帖子创建于 {created_at_str})"
             hours_diff_str = "未知"
 
         else:
@@ -770,8 +903,9 @@ def main_bot_runner():
         except Exception:
             pass
 
-        if not bot.bot_token:
-            bot_log.critical(f"未能从 {CONFIG_FILENAME} 预加载 'bot_token'。请确保配置文件存在且包含token。")
+    if not bot.bot_token:
+        bot_log.critical(f"未能从 {CONFIG_FILENAME} 预加载 'bot_token'。请确保配置文件存在且包含token。")
+        return
 
     try:
         bot.run(bot.bot_token)
