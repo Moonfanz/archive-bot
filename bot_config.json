@@ -9,7 +9,18 @@
             ],
             "max_active_posts": 100,
             "inactivity_days": 0,
-            "notification_thread_id": 1313410500876566578
+            "notification_thread_id": 1313410500876566578,
+
+            "pinned_thread_moderation": {
+                "enabled": true,
+                "allowed_role_ids": [
+                    "1337450755791261766"
+                ],
+                "allowed_user_ids": [
+                    "1400045042349113394",
+                    "954037609313747036"
+                ]
+            }
         }
     }
 }
