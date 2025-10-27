@@ -95,10 +95,10 @@ class GuildArchiveSettings:
             only_archive_monitored_channels=data.get("only_archive_monitored_channels", False),
             monitoring_channel_ids=data.get("monitoring_channel_ids", []),
             archive_category_id=data.get("archive_category_id"),
-            inactivity_days=data.get("inactivity_days"),
+            inactivity_days=data.get("inactivity_days", 0),
             notification_thread_id=data.get("notification_thread_id"),
-            max_active_posts=data.get("max_active_posts"),
-            max_active_threads=data.get("max_active_threads"),
+            max_active_posts=data.get("max_active_posts", 100),
+            max_active_threads=data.get("max_active_threads", 900),
             last_notice_message_id=data.get("last_notice_message_id"),
             pinned_thread_moderation=data.get("pinned_thread_moderation")
         )
@@ -138,6 +138,10 @@ class ThreadArchiverBot(commands.Bot):
         self.BUMP_RECORDS_FILE = DATA_DIRECTORY / "pinned_thread_bump_records.json"
         self.bump_records: dict[int, dict] = {}
         self.bump_records_lock = asyncio.Lock()
+
+        self.PINNED_MESSAGES_FILE = DATA_DIRECTORY / "pinned_thread_last_messages.json"
+        self.pinned_last_messages: dict[int, int] = {}
+        self.pinned_messages_lock = asyncio.Lock()
 
         self.succeed_count = 0
         self.fail_count = 0
@@ -236,6 +240,28 @@ class ThreadArchiverBot(commands.Bot):
         except (json.JSONDecodeError, KeyError, TypeError) as e:
             bot_log.error(f"加载刷新记录文件失败，文件可能已损坏: {e}", exc_info=True)
 
+    def _load_pinned_last_messages(self):
+        """同步加载置顶帖最后消息ID记录"""
+        try:
+            with open(self.PINNED_MESSAGES_FILE, 'r', encoding='utf-8') as f:
+                data = json.load(f)
+                self.pinned_last_messages = {int(k): int(v) for k, v in data.items()}
+                bot_log.info(f"成功加载了 {len(self.pinned_last_messages)} 条置顶帖消息记录。")
+        except FileNotFoundError:
+            bot_log.info(f"置顶帖消息记录文件未找到，将创建新的。")
+        except Exception as e:
+            bot_log.error(f"加载置顶帖消息记录失败: {e}", exc_info=True)
+
+    async def _save_pinned_last_messages(self):
+        """保存置顶帖最后消息ID记录到文件"""
+        async with self.pinned_messages_lock:
+            try:
+                data = {str(k): v for k, v in self.pinned_last_messages.items()}
+                with open(self.PINNED_MESSAGES_FILE, 'w', encoding='utf-8') as f:
+                    json.dump(data, f, indent=4)
+            except Exception as e:
+                bot_log.error(f"保存置顶帖消息记录失败: {e}", exc_info=True)
+
     async def _save_bump_records(self):
         """将内存中的刷新记录保存到文件"""
         async with self.bump_records_lock:
@@ -252,9 +278,11 @@ class ThreadArchiverBot(commands.Bot):
             except Exception as e:
                 bot_log.error(f"保存刷新记录到 {self.BUMP_RECORDS_FILE} 失败: {e}", exc_info=True)
     
+    
     async def setup_hook(self):
         """Bot启动时的异步设置"""
         self._load_bump_records()
+        self._load_pinned_last_messages()
         await self.load_configuration()
         await self.add_cog(ArchiveManagerCog(self))
     
@@ -472,6 +500,11 @@ class ThreadArchiverBot(commands.Bot):
         pinned_server_wide_count = len(pinned_threads_set_server_wide)
         initial_log_info += f"\n全服务器置顶帖子数: **{pinned_server_wide_count}**"
         overall_summary_embed_description += f"> 全服置顶帖: {pinned_server_wide_count}\n"
+        
+        # --- 置顶帖消息审计 ---
+        if settings.pinned_mod_enabled and pinned_server_wide_count > 0:
+            audit_log = await self._audit_pinned_thread_messages(guild, settings, pinned_threads_set_server_wide)
+            initial_log_info += audit_log
         
         # --- 步骤 3: 服务器级数量控制 ---
         kill_count_server_level = current_total_server_threads - settings.max_active_threads
@@ -702,6 +735,134 @@ class ThreadArchiverBot(commands.Bot):
             await asyncio.sleep(0.05)
 
         await asyncio.gather(*tasks_list)
+
+    async def _audit_pinned_thread_messages(self, guild: Guild, settings: GuildArchiveSettings, pinned_thread_ids: set[int]) -> str:
+        """审计置顶帖中的漏监听消息"""
+        log_info = f"\n置顶帖消息审计:"
+        deleted_count = 0
+        checked_count = 0
+        audit_details = []
+        
+        # 获取所有置顶帖
+        pinned_threads = []
+        for thread_id in pinned_thread_ids:
+            try:
+                thread = guild.get_thread(thread_id)
+                if thread and not thread.locked:  # 只处理非锁定的置顶帖
+                    pinned_threads.append(thread)
+            except Exception as e:
+                bot_log.warning(f"获取置顶帖 {thread_id} 失败: {e}")
+        
+        log_info += f"\n  找到 {len(pinned_threads)} 个非锁定置顶帖进行审计"
+        
+        for thread in pinned_threads:
+            try:
+                checked_count += 1
+                current_last_message_id = thread.last_message_id
+                stored_last_message_id = self.pinned_last_messages.get(thread.id)
+                
+                # 如果没有记录或当前ID与记录不一致，说明有新消息
+                if stored_last_message_id is None or current_last_message_id != stored_last_message_id:
+                    log_info += f"\n  [新消息检测] {thread.name} (ID: {thread.id})"
+                    
+                    # 添加到embed详情
+                    audit_key = f"[审计] {thread.name}"
+                    if stored_last_message_id is None:
+                        audit_desc = f"> 首次检测，拉取最新消息进行审计"
+                    else:
+                        audit_desc = f"> 检测到变化，拉取最新消息审计"
+                    
+                    # 拉取最新的一批消息（固定数量）
+                    recent_messages = []
+                    try:
+                        async for message in thread.history(limit=50):
+                            recent_messages.append(message)
+                    except discord.Forbidden:
+                        log_info += f" -> 无权限访问历史记录"
+                        audit_desc += "\n> 无权限访问历史记录"
+                        audit_details.append((audit_key, audit_desc))
+                        continue
+                    except Exception as e:
+                        log_info += f" -> 获取历史记录失败: {e}"
+                        audit_desc += f"\n> 获取历史记录失败: {e}"
+                        audit_details.append((audit_key, audit_desc))
+                        continue
+                    
+                    if recent_messages:
+                        log_info += f" -> 拉取了 {len(recent_messages)} 条最新消息"
+                        audit_desc += f"\n> 拉取了 {len(recent_messages)} 条最新消息"
+                        
+                        # 筛选需要删除的消息（3天内的消息）
+                        now_utc = datetime.now(timezone.utc)
+                        three_days_ago = now_utc - timedelta(days=3)
+                        
+                        deleted_messages_info = []
+                        processed_count = 0
+                        for message in recent_messages:
+                            # 检查消息时间是否在3天内
+                            if message.created_at < three_days_ago:
+                                continue
+                            
+                            processed_count += 1
+                            
+                            # 检查用户是否在白名单中
+                            author = message.author
+                            if author.bot:
+                                continue
+                                
+                            # 检查用户ID是否豁免
+                            if author.id in settings.allowed_user_ids:
+                                continue
+                                
+                            # 检查用户身份组ID是否豁免
+                            if isinstance(author, discord.Member):
+                                author_role_ids = {role.id for role in author.roles}
+                                if not author_role_ids.isdisjoint(settings.allowed_role_ids):
+                                    continue
+                            
+                            # 删除消息
+                            try:
+                                await message.delete()
+                                deleted_count += 1
+                                log_info += f"\n    [已删除] 用户 {author.name} 的消息 (ID: {message.id})"
+                                deleted_messages_info.append(f"用户 {author.name} 的消息 (ID: {message.id})")
+                            except discord.Forbidden:
+                                log_info += f"\n    [删除失败] 无权限删除消息 (ID: {message.id})"
+                                deleted_messages_info.append(f"无权限删除消息 (ID: {message.id})")
+                            except discord.NotFound:
+                                # 消息可能已经被删除
+                                pass
+                            except Exception as e:
+                                log_info += f"\n    [删除失败] 消息 {message.id}: {e}"
+                                deleted_messages_info.append(f"删除失败: {message.id} ({e})")
+                        
+                        if processed_count > 0:
+                            audit_desc += f"\n> 检查了 {processed_count} 条3天内消息"
+                        if deleted_messages_info:
+                            audit_desc += f"\n> 删除操作: {'\n> '.join(deleted_messages_info)}"
+                    
+                    # 更新最后消息ID记录
+                    if current_last_message_id:
+                        self.pinned_last_messages[thread.id] = current_last_message_id
+                        await self._save_pinned_last_messages()
+                        log_info += f" -> 已更新最后消息ID: {current_last_message_id}"
+                        audit_desc += f"\n> 已更新最后消息ID: {current_last_message_id}"
+                    
+                    audit_details.append((audit_key, audit_desc))
+                
+            except Exception as e:
+                log_info += f"\n  [审计失败] 处理 {thread.name} 时发生错误: {e}"
+                audit_key = f"[审计失败] {thread.name}"
+                audit_desc = f"> 处理时发生错误: {e}"
+                audit_details.append((audit_key, audit_desc))
+        
+        # 将审计详情添加到embed字段
+        for audit_key, audit_desc in audit_details:
+            if len(self.archive_run_details_for_embed) < 10:
+                self.archive_run_details_for_embed[audit_key] = audit_desc
+        
+        log_info += f"\n  审计完成: 检查了 {checked_count} 个置顶帖，删除了 {deleted_count} 条消息"
+        return log_info
 
     async def _archive_thread(self, thread: discord.Thread, last_msg_obj: discord.Message | ErrorMessage, settings: GuildArchiveSettings):
         archive_reason = f"自动归档"
