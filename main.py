@@ -294,6 +294,34 @@ class ThreadArchiverBot(commands.Bot):
 
         self.periodic_thread_audit.start()
 
+    def _is_user_exempt(self, author: discord.Member | discord.User, thread: discord.Thread, settings: GuildArchiveSettings) -> bool:
+        """
+        检查用户是否在置顶帖中拥有消息豁免权。
+        返回 True 表示用户豁免，不应删除其消息。
+        """
+
+        # 帖主 豁免
+        if thread.owner_id and author.id == thread.owner_id:
+            return True
+
+        # 只有 discord.Member 对象才有权限和角色信息，需要进行类型检查
+        if isinstance(author, discord.Member):
+            # 服务器管理员 (Administrator) 豁免
+            if author.guild_permissions.administrator:
+                return True
+            
+            # 在配置中的豁免角色组ID (allowed_role_ids)
+            author_role_ids = {role.id for role in author.roles}
+            if not author_role_ids.isdisjoint(settings.allowed_role_ids):
+                return True
+
+        # 在配置中的豁免用户ID (allowed_user_ids)
+        if author.id in settings.allowed_user_ids:
+            return True
+        
+        # 如果以上规则都不满足，则用户不豁免
+        return False
+
     async def on_ready(self):
         if not self.user:
             bot_log.error("机器人未能正确初始化 self.user。")
@@ -344,15 +372,8 @@ class ThreadArchiverBot(commands.Bot):
         # 检查用户是否在豁免名单中
         author = message.author
         
-        # 检查用户ID是否豁免
-        if author.id in settings.allowed_user_ids:
+        if self._is_user_exempt(author, thread, settings):
             return
-            
-        # 检查用户身份组ID是否豁免
-        if isinstance(author, discord.Member):
-            author_role_ids = {role.id for role in author.roles}
-            if not author_role_ids.isdisjoint(settings.allowed_role_ids):
-                return
         
         # 如果用户不在豁免名单，则删除消息
         try:
@@ -807,18 +828,9 @@ class ThreadArchiverBot(commands.Bot):
                             
                             # 检查用户是否在白名单中
                             author = message.author
-                            if author.bot:
+                            
+                            if self._is_user_exempt(author, thread, settings):
                                 continue
-                                
-                            # 检查用户ID是否豁免
-                            if author.id in settings.allowed_user_ids:
-                                continue
-                                
-                            # 检查用户身份组ID是否豁免
-                            if isinstance(author, discord.Member):
-                                author_role_ids = {role.id for role in author.roles}
-                                if not author_role_ids.isdisjoint(settings.allowed_role_ids):
-                                    continue
                             
                             # 删除消息
                             try:
