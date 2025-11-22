@@ -50,23 +50,31 @@ bot_log = setup_logging()
 
 # --- 自定义数据类 ---
 class GuildArchiveSettings:
-    """封装单个服务器的归档设置"""
-    def __init__(self, guild_id: int, config_name: str, only_archive_monitored_channels: bool, monitoring_channel_ids: list[int],
-                 archive_category_id: int | None, inactivity_days: int, notification_thread_id: int | None,
-                 max_active_posts: int,
-                 max_active_threads: int,
-                 last_notice_message_id: int | None = None,
-                 pinned_thread_moderation: dict | None = None):
+    """封装单个服务器的归档设置（黑名单模式）"""
+    def __init__(
+        self,
+        guild_id: int,
+        config_name: str,
+        blacklist_channel_ids: list[int],
+        archive_category_id: int | None,
+        inactivity_days: int,
+        notification_thread_id: int | None,
+        max_active_posts: int,
+        max_active_threads: int,
+        last_notice_message_id: int | None = None,
+        pinned_thread_moderation: dict | None = None,
+    ):
         self.guild_id = guild_id
         self.config_name = config_name
-        self.only_archive_monitored_channels = False
-        self.monitoring_channel_ids = monitoring_channel_ids
+        # 黑名单频道：这些频道中的帖子计入活跃总数，但不会被自动归档
+        self.blacklist_channel_ids = blacklist_channel_ids or []
         self.archive_category_id = archive_category_id
         self.inactivity_days = inactivity_days
         self.notification_thread_id = notification_thread_id
         self.max_active_posts = max_active_posts
         self.max_active_threads = max_active_threads
         self.last_notice_message_id = last_notice_message_id
+
         mod_settings = pinned_thread_moderation or {}
         self.pinned_mod_enabled = mod_settings.get("enabled", False)
         self.allowed_role_ids = [int(role_id) for role_id in mod_settings.get("allowed_role_ids", [])]
@@ -76,14 +84,18 @@ class GuildArchiveSettings:
         """将设置转换为字典以便保存到JSON"""
         return {
             "guild_id": self.guild_id,
-            "only_archive_monitored_channels": self.only_archive_monitored_channels,
-            "monitoring_channel_ids": self.monitoring_channel_ids,
+            "blacklist_channel_ids": self.blacklist_channel_ids,
             "archive_category_id": self.archive_category_id,
             "inactivity_days": self.inactivity_days,
             "notification_thread_id": self.notification_thread_id,
             "max_active_posts": self.max_active_posts,
             "max_active_threads": self.max_active_threads,
-            "last_notice_message_id": self.last_notice_message_id
+            "last_notice_message_id": self.last_notice_message_id,
+            "pinned_thread_moderation": {
+                "enabled": self.pinned_mod_enabled,
+                "allowed_role_ids": [str(role_id) for role_id in self.allowed_role_ids],
+                "allowed_user_ids": [str(user_id) for user_id in self.allowed_user_ids],
+            },
         }
 
     @classmethod
@@ -92,15 +104,14 @@ class GuildArchiveSettings:
         return cls(
             guild_id=guild_id,
             config_name=config_name,
-            only_archive_monitored_channels=data.get("only_archive_monitored_channels", False),
-            monitoring_channel_ids=data.get("monitoring_channel_ids", []),
+            blacklist_channel_ids=data.get("blacklist_channel_ids", []),
             archive_category_id=data.get("archive_category_id"),
             inactivity_days=data.get("inactivity_days", 0),
             notification_thread_id=data.get("notification_thread_id"),
             max_active_posts=data.get("max_active_posts", 100),
             max_active_threads=data.get("max_active_threads", 900),
             last_notice_message_id=data.get("last_notice_message_id"),
-            pinned_thread_moderation=data.get("pinned_thread_moderation")
+            pinned_thread_moderation=data.get("pinned_thread_moderation"),
         )
 
 class ErrorMessage: 
@@ -153,20 +164,28 @@ class ThreadArchiverBot(commands.Bot):
         self.archive_run_details_for_embed = {}
 
     async def load_configuration(self):
-        """加载配置"""
+        """加载配置（从环境变量 GUILD_CONFIGS_JSON）"""
         self.bot_token = os.environ.get("BOT_TOKEN")
 
         if not self.bot_token:
-            logging.error("未能从环境变量加载 BOT_TOKEN。请检查 .env 文件。")
+            bot_log.critical("未能从环境变量加载 BOT_TOKEN。请检查 .env 文件。")
+            sys.exit(1)
+
+        raw_json = os.environ.get("GUILD_CONFIGS_JSON")
+        if not raw_json:
+            bot_log.critical("未能从环境变量加载 GUILD_CONFIGS_JSON。请在 .env 中配置服务器参数。")
             sys.exit(1)
 
         try:
-            with open(CONFIG_FILENAME, 'r', encoding='utf-8') as f:
-                self.global_config = json.load(f)
+            # 约定：GUILD_CONFIGS_JSON 是一个 JSON 对象，键为配置名，值为服务器配置
+            guild_configurations = json.loads(raw_json)
+            if not isinstance(guild_configurations, dict):
+                raise ValueError("GUILD_CONFIGS_JSON 必须是一个 JSON 对象，其键为服务器配置名。")
 
-            raw_guild_configs = self.global_config.get("guild_configurations", {})
+            # 为兼容原有结构，仍然保留 self.global_config["guild_configurations"]
+            self.global_config = {"guild_configurations": guild_configurations}
 
-            for config_name, settings_data in raw_guild_configs.items():
+            for config_name, settings_data in guild_configurations.items():
                 guild_id = settings_data.get("guild_id")
 
                 if not guild_id:
@@ -179,7 +198,6 @@ class ThreadArchiverBot(commands.Bot):
                 if notice_id_file.exists():
                     try:
                         last_notice_id = int(notice_id_file.read_text().strip())
-
                     except ValueError:
                         bot_log.warning(f"无法解析 {notice_id_file} 中的消息ID。")
 
@@ -189,31 +207,25 @@ class ThreadArchiverBot(commands.Bot):
                 self.guild_settings_map[guild_id] = guild_setting
                 bot_log.info(f"已加载服务器 '{config_name}' (ID: {guild_id}) 的配置。")
 
-        except FileNotFoundError:
-            bot_log.critical(f"配置文件 {CONFIG_FILENAME} 未找到。请根据模板创建它。")
-            sys.exit(1)
-
         except json.JSONDecodeError:
-            bot_log.critical(f"配置文件 {CONFIG_FILENAME} 格式错误。")
+            bot_log.critical("环境变量 GUILD_CONFIGS_JSON 的 JSON 格式错误。")
             sys.exit(1)
-
         except Exception as e:
-            bot_log.critical(f"加载配置时发生未知错误: {e}", exc_info=True)
+            bot_log.critical(f"加载 GUILD_CONFIGS_JSON 时发生未知错误: {e}", exc_info=True)
             sys.exit(1)
 
     async def save_guild_setting(self, guild_id: int):
-        """保存单个服务器的配置"""
+        """保存单个服务器的配置（写回 .env 中的 GUILD_CONFIGS_JSON，并更新本地通知ID文件）"""
         if guild_id not in self.guild_settings_map:
             bot_log.error(f"尝试保存未知的服务器配置: {guild_id}")
             return
 
         setting = self.guild_settings_map[guild_id]
         try:
-            with open(CONFIG_FILENAME, 'w', encoding='utf-8') as f:
-                json.dump(self.global_config, f, indent=4, ensure_ascii=False)
-            bot_log.info(f"全局配置文件 {CONFIG_FILENAME} 已更新。")
+            self._save_guild_configs_to_env()
+            bot_log.info(".env 中的 GUILD_CONFIGS_JSON 已更新。")
         except Exception as e:
-            bot_log.error(f"写入 {CONFIG_FILENAME} 失败: {e}", exc_info=True)
+            bot_log.error(f"写入 .env 中的 GUILD_CONFIGS_JSON 失败: {e}", exc_info=True)
 
         if setting.last_notice_message_id is not None:
             notice_id_file = DATA_DIRECTORY / f"{setting.config_name}_notice_id.txt"
@@ -222,6 +234,45 @@ class ThreadArchiverBot(commands.Bot):
                 bot_log.info(f"已更新 {setting.config_name} 的通知消息ID到 {notice_id_file}")
             except Exception as e:
                 bot_log.error(f"写入 {notice_id_file} 失败: {e}", exc_info=True)
+
+    def _save_guild_configs_to_env(self):
+        """将当前内存中的服务器配置写回到 .env 的 GUILD_CONFIGS_JSON 变量"""
+        # 先从 GuildArchiveSettings 对象重建配置字典，确保与运行时状态一致
+        guild_configurations: dict[str, dict] = {}
+        for setting in self.guild_settings_map.values():
+            guild_configurations[setting.config_name] = setting.to_dict()
+
+        self.global_config = {"guild_configurations": guild_configurations}
+
+        new_json_str = json.dumps(guild_configurations, ensure_ascii=False)
+
+        env_path = Path(".env")
+        existing_content = ""
+        if env_path.exists():
+            existing_content = env_path.read_text(encoding="utf-8")
+
+        lines = existing_content.splitlines() if existing_content else []
+        new_line = f"GUILD_CONFIGS_JSON={new_json_str}"
+
+        updated = False
+        for idx, line in enumerate(lines):
+            stripped = line.strip()
+            if stripped.startswith("GUILD_CONFIGS_JSON="):
+                lines[idx] = new_line
+                updated = True
+                break
+
+        if not updated:
+            if lines and lines[-1].strip() != "":
+                lines.append("")
+            lines.append(new_line)
+
+        if lines:
+            new_content = "\n".join(lines) + "\n"
+        else:
+            new_content = new_line + "\n"
+
+        env_path.write_text(new_content, encoding="utf-8")
     
     
     def _load_bump_records(self):
@@ -434,12 +485,14 @@ class ThreadArchiverBot(commands.Bot):
         global_start_time = time.time()
         overall_summary_embed_description += f"> 不活跃 **{settings.inactivity_days}** 天归档：**{'开启' if settings.inactivity_days > 0 else '关闭'}**\n"
         initial_log_info += f"> 不活跃 **{settings.inactivity_days}** 天归档: {'开启' if settings.inactivity_days > 0 else '关闭'}\n"
-        if settings.only_archive_monitored_channels:
-            overall_summary_embed_description += f"> 仅归档 **{len(settings.monitoring_channel_ids)}** 个频道\n"
-            overall_summary_embed_description += f"> 正在监控 **{len(settings.monitoring_channel_ids)}** 个频道\n"
-            initial_log_info += f"正在监控 {len(settings.monitoring_channel_ids)} 个频道\n"
-        else: 
-            overall_summary_embed_description += f"> 正在监控 **所有频道**\n"
+
+        blacklist_count = len(settings.blacklist_channel_ids)
+        if blacklist_count > 0:
+            overall_summary_embed_description += f"> 黑名单频道数: **{blacklist_count}**（这些频道中的帖子不会被自动归档）\n"
+            initial_log_info += f"已配置 {blacklist_count} 个黑名单频道，这些频道中的帖子不会被自动归档。\n"
+        else:
+            overall_summary_embed_description += f"> 未配置黑名单频道，默认对所有频道执行归档策略\n"
+            initial_log_info += "未配置黑名单频道，将对所有频道执行归档策略。\n"
 
         overall_summary_embed_description += "\n"
 
@@ -539,26 +592,18 @@ class ThreadArchiverBot(commands.Bot):
 
             candidate_threads_for_server_kill = []
 
-            # 只处理监控频道内的帖子
-            if settings.only_archive_monitored_channels:
-                monitored_parent_ids_set = set(settings.monitoring_channel_ids)
+            # 黑名单频道内的帖子计入活跃总数，但不会作为归档候选
+            blacklisted_parent_ids_set = set(settings.blacklist_channel_ids)
 
-                for thread_obj in all_server_active_threads_list:
-                    if thread_obj.id not in pinned_threads_set_server_wide and \
-                    thread_obj.parent_id in monitored_parent_ids_set and \
-                    not thread_obj.locked:
-                        candidate_threads_for_server_kill.append(thread_obj)
+            for thread_obj in all_server_active_threads_list:
+                if (
+                    thread_obj.id not in pinned_threads_set_server_wide
+                    and not thread_obj.locked
+                    and thread_obj.parent_id not in blacklisted_parent_ids_set
+                ):
+                    candidate_threads_for_server_kill.append(thread_obj)
 
-                initial_log_info += f"\n  来自监控频道的、非置顶、非锁定的候选帖子数: {len(candidate_threads_for_server_kill)}"
-
-            # 处理所有频道内的帖子
-            else:
-                for thread_obj in all_server_active_threads_list:
-                    if thread_obj.id not in pinned_threads_set_server_wide and \
-                    not thread_obj.locked:
-                        candidate_threads_for_server_kill.append(thread_obj)
-
-                initial_log_info += f"\n  非置顶、非锁定的候选帖子数: {len(candidate_threads_for_server_kill)}"
+            initial_log_info += f"\n  可用于服务器级归档的候选帖子数(排除置顶/锁定/黑名单频道): {len(candidate_threads_for_server_kill)}"
 
             if candidate_threads_for_server_kill:
                 get_msg_start = time.time()
@@ -589,25 +634,28 @@ class ThreadArchiverBot(commands.Bot):
 
         # --- 步骤 4: 基于频道的不活跃天数归档---
         if settings.inactivity_days > 0:
-            log_inactivity_phase = "\n开始检查各监控频道的不活跃帖子..."
+            log_inactivity_phase = "\n开始检查各非黑名单频道中的不活跃帖子..."
 
-            monitored_forum_channel_ids_set = set(settings.monitoring_channel_ids)
+            blacklisted_forum_channel_ids_set = set(settings.blacklist_channel_ids)
 
-            # 从之前获取的全服务器活跃帖子中筛选出仍在监控频道内且仍然活跃（未被服务器级归档）的帖子
-            active_threads_in_monitored_forums_for_inactivity_check = []
+            # 从之前获取的全服务器活跃帖子中筛选出仍在非黑名单频道内且仍然活跃（未被服务器级归档）的帖子
+            active_threads_for_inactivity_check = []
             for t_obj in all_server_active_threads_list:
-                if t_obj.parent_id in monitored_forum_channel_ids_set and \
-                t_obj.id not in pinned_threads_set_server_wide and \
-                not t_obj.archived and not t_obj.locked:
-                    active_threads_in_monitored_forums_for_inactivity_check.append(t_obj)
+                if (
+                    t_obj.parent_id not in blacklisted_forum_channel_ids_set
+                    and t_obj.id not in pinned_threads_set_server_wide
+                    and not t_obj.archived
+                    and not t_obj.locked
+                ):
+                    active_threads_for_inactivity_check.append(t_obj)
 
-            if active_threads_in_monitored_forums_for_inactivity_check:
-                log_inactivity_phase += f"\n  找到 {len(active_threads_in_monitored_forums_for_inactivity_check)} 个在监控频道中的活跃、非置顶帖进行不活跃检查"
+            if active_threads_for_inactivity_check:
+                log_inactivity_phase += f"\n  找到 {len(active_threads_for_inactivity_check)} 个在非黑名单频道中的活跃、非置顶帖进行不活跃检查"
 
                 get_msg_start_ia = time.time()
                 current_msg_succeed = self.message_succeed_count
                 current_msg_fail = self.not_found_error_count
-                thread_message_obj_list_inactivity = await self._get_last_message_task(active_threads_in_monitored_forums_for_inactivity_check)
+                thread_message_obj_list_inactivity = await self._get_last_message_task(active_threads_for_inactivity_check)
                 get_msg_time_ia = time.time() - get_msg_start_ia
                 log_inactivity_phase += f"\n  获取不活跃检查帖子的最后一条消息耗时: {get_msg_time_ia:.3f}s (S:{self.message_succeed_count-current_msg_succeed}/F:{self.not_found_error_count-current_msg_fail})"
 
@@ -851,7 +899,8 @@ class ThreadArchiverBot(commands.Bot):
                         if processed_count > 0:
                             audit_desc += f"\n> 检查了 {processed_count} 条3天内消息"
                         if deleted_messages_info:
-                            audit_desc += f"\n> 删除操作: {'\n> '.join(deleted_messages_info)}"
+                            deleted_lines = "\n> ".join(deleted_messages_info)
+                            audit_desc += "\n> 删除操作: " + deleted_lines
                     
                     # 更新最后消息ID记录
                     if current_last_message_id:
@@ -936,13 +985,15 @@ class ArchiveManagerCog(commands.Cog):
     def __init__(self, bot: ThreadArchiverBot):
         self.bot = bot
 
-    @app_commands.command(name="set-archive-rules", description="设置指定服务器的归档规则。")
+    @app_commands.command(name="set-archive-rules", description="设置当前服务器的归档规则（不活跃天数、活跃帖数量等）。")
     @app_commands.describe(
-        config_name="在bot_config.json中定义的服务器配置名",
-        inactivity_days="帖子多少天不活跃后归档 (0表示不启用此规则)",
-        max_active_posts="频道内最大活跃帖子数 (0表示不启用此规则)",
-        max_active_threads="整个服务器的最大活跃帖子数"
+        config_name="在环境变量 GUILD_CONFIGS_JSON 中定义的服务器配置名",
+        inactivity_days="帖子多少天不活跃后自动归档 (0 表示关闭按天归档)",
+        max_active_posts="频道内最大活跃帖子数上限 (0 表示不限制；当前仍未在逻辑中使用，仅预留)",
+        max_active_threads="整个服务器允许的最大活跃帖子数上限"
     )
+    @app_commands.default_permissions(manage_guild=True)
+    @app_commands.guild_only()
     @app_commands.checks.has_permissions(manage_guild=True)
     async def set_archive_rules_cmd(self, interaction: discord.Interaction,
                                     config_name: str, inactivity_days: int, max_active_posts: int, max_active_threads: int):
@@ -964,10 +1015,6 @@ class ArchiveManagerCog(commands.Cog):
         target_setting.inactivity_days = inactivity_days if inactivity_days >= 0 else target_setting.inactivity_days
         target_setting.max_active_posts = max_active_posts if max_active_posts >= 0 else target_setting.max_active_posts
 
-        if config_name in self.bot.global_config.get("guild_configurations", {}):
-            self.bot.global_config["guild_configurations"][config_name]["inactivity_days"] = target_setting.inactivity_days
-            self.bot.global_config["guild_configurations"][config_name]["max_active_posts"] = target_setting.max_active_posts
-
         await self.bot.save_guild_setting(guild_id_to_update)
 
         embed = Embed(title="归档规则已更新", color=Color.green())
@@ -979,8 +1026,10 @@ class ArchiveManagerCog(commands.Cog):
         await interaction.followup.send(embed=embed, ephemeral=True)
         bot_log.info(f"用户 {interaction.user} 更新了 '{config_name}' 的归档规则。")
 
-    @app_commands.command(name="manual-guild-archive", description="手动触发对指定配置服务器的归档检查。")
-    @app_commands.describe(config_name="在bot_config.json中定义的服务器配置名")
+    @app_commands.command(name="manual-guild-archive", description="手动触发一次归档审计（服务器级 + 不活跃检查）。")
+    @app_commands.describe(config_name="在 GUILD_CONFIGS_JSON 中配置的服务器别名")
+    @app_commands.default_permissions(manage_guild=True)
+    @app_commands.guild_only()
     @app_commands.checks.has_permissions(manage_guild=True)
     async def manual_guild_archive_cmd(self, interaction: discord.Interaction, config_name: str):
         await interaction.response.defer(ephemeral=True, thinking=True)
@@ -1013,8 +1062,9 @@ class ArchiveManagerCog(commands.Cog):
             await self.bot.process_guild_threads(guild, target_setting, manual=True)
             await interaction.edit_original_response(content=f"对服务器配置 '{config_name}' 的手动归档检查已完成。详情请查看通知频道。")
 
-    @app_commands.command(name="view-guild-config", description="查看指定服务器的当前归档配置。") 
-    @app_commands.describe(config_name="在bot_config.json中定义的服务器配置名 (留空查看所有)")
+    @app_commands.command(name="view-guild-config", description="查看已加载的服务器归档配置。")
+    @app_commands.describe(config_name="在 GUILD_CONFIGS_JSON 中定义的服务器配置名（留空查看所有）")
+    @app_commands.guild_only()
     async def view_guild_config_cmd(self, interaction: discord.Interaction, config_name: str | None = None):
         await interaction.response.defer(ephemeral=True)
         embeds_to_send = []
@@ -1042,7 +1092,7 @@ class ArchiveManagerCog(commands.Cog):
         for setting in settings_list:
             embed = Embed(title=f"配置: {setting.config_name}", color=Color.blue())
             embed.add_field(name="服务器ID", value=str(setting.guild_id), inline=False)
-            embed.add_field(name="监控频道ID", value=", ".join(map(str, setting.monitoring_channel_ids)) or "未设置", inline=False)
+            embed.add_field(name="黑名单频道ID", value=", ".join(map(str, setting.blacklist_channel_ids)) or "未设置", inline=False)
             embed.add_field(name="归档分类ID", value=str(setting.archive_category_id) if setting.archive_category_id else "未设置", inline=False)
 
             inactivity_days_str = f"{setting.inactivity_days} 天" if setting.inactivity_days > 0 else "未启用"
@@ -1068,16 +1118,11 @@ class ArchiveManagerCog(commands.Cog):
 def main_bot_runner():
     bot = ThreadArchiverBot()
 
-    if not bot.bot_token:
-        try:
-            with open(CONFIG_FILENAME, 'r', encoding='utf-8') as f:
-                temp_config = json.load(f)
-            bot.bot_token = os.environ.get('BOT_TOKEN') or temp_config.get('bot_token')
-        except Exception:
-            pass
+    # 优先从环境变量读取 BOT_TOKEN（由 .env 提供）
+    bot.bot_token = os.environ.get("BOT_TOKEN")
 
     if not bot.bot_token:
-        bot_log.critical(f"未能从 {CONFIG_FILENAME} 预加载 'bot_token'。请确保配置文件存在且包含token。")
+        bot_log.critical("未能从环境变量 BOT_TOKEN 读取机器人令牌。请在 .env 中配置 BOT_TOKEN。")
         return
 
     try:
