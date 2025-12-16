@@ -7,6 +7,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 import time
 import hashlib
+import re
 
 import discord
 from discord.ext import commands, tasks
@@ -62,6 +63,7 @@ class GuildArchiveSettings:
         notification_thread_id: int | None,
         max_active_posts: int,
         max_active_threads: int,
+        channel_groups: dict[str, list[int]] | None = None,
         last_notice_message_id: int | None = None,
         pinned_thread_moderation: dict | None = None,
     ):
@@ -77,6 +79,19 @@ class GuildArchiveSettings:
         self.max_active_posts = max_active_posts
         self.max_active_threads = max_active_threads
         self.last_notice_message_id = last_notice_message_id
+
+        # 频道组合：自定义名称映射到一组频道ID
+        normalized_groups: dict[str, list[int]] = {}
+        if channel_groups:
+            for name, id_list in channel_groups.items():
+                if not id_list:
+                    continue
+                try:
+                    normalized_groups[str(name)] = [int(cid) for cid in id_list]
+                except Exception:
+                    # 如果单个组合解析失败，则跳过该组合，避免影响整体配置
+                    continue
+        self.channel_groups: dict[str, list[int]] = normalized_groups
 
         mod_settings = pinned_thread_moderation or {}
         self.pinned_mod_enabled = mod_settings.get("enabled", False)
@@ -94,6 +109,10 @@ class GuildArchiveSettings:
             "notification_thread_id": self.notification_thread_id,
             "max_active_posts": self.max_active_posts,
             "max_active_threads": self.max_active_threads,
+            "channel_groups": {
+                str(name): [int(cid) for cid in (id_list or [])]
+                for name, id_list in (self.channel_groups or {}).items()
+            },
             "last_notice_message_id": self.last_notice_message_id,
             "pinned_thread_moderation": {
                 "enabled": self.pinned_mod_enabled,
@@ -115,6 +134,7 @@ class GuildArchiveSettings:
             notification_thread_id=data.get("notification_thread_id"),
             max_active_posts=data.get("max_active_posts", 100),
             max_active_threads=data.get("max_active_threads", 900),
+            channel_groups=data.get("channel_groups") or {},
             last_notice_message_id=data.get("last_notice_message_id"),
             pinned_thread_moderation=data.get("pinned_thread_moderation"),
         )
@@ -1160,6 +1180,15 @@ class ArchiveManagerCog(commands.Cog):
             embed.add_field(name="优先归档频道ID", value=", ".join(map(str, setting.priority_channel_ids)) or "未设置", inline=False)
             embed.add_field(name="归档分类ID", value=str(setting.archive_category_id) if setting.archive_category_id else "未设置", inline=False)
 
+            channel_groups_desc = "未设置"
+            if getattr(setting, "channel_groups", None):
+                lines = []
+                for group_name, id_list in setting.channel_groups.items():
+                    ids_str = ", ".join(str(cid) for cid in id_list) if id_list else "（空）"
+                    lines.append(f"{group_name}: {ids_str}")
+                channel_groups_desc = "\n".join(lines)
+            embed.add_field(name="频道组合", value=channel_groups_desc, inline=False)
+
             inactivity_days_str = f"{setting.inactivity_days} 天" if setting.inactivity_days > 0 else "未启用"
             max_posts_str = str(setting.max_active_posts) if setting.max_active_posts > 0 else "未启用"
             max_active_threads = str(setting.max_active_threads) if setting.max_active_threads > 0 else "未启用"
@@ -1178,6 +1207,231 @@ class ArchiveManagerCog(commands.Cog):
                 await interaction.followup.send(embeds=embeds_to_send[i:i+10], ephemeral=True)
         else:
             await interaction.followup.send("未能生成配置信息。",ephemeral=True)
+
+    @app_commands.command(name="set-channel-group", description="设置或更新一个频道组合名，对应一组频道。")
+    @app_commands.describe(
+        group_name="自定义的频道组合名称（例如：资源区）",
+        channels="此组合包含的频道，可以输入频道 mention 或频道 ID，多个用空格或逗号分隔。"
+    )
+    @app_commands.default_permissions(manage_guild=True)
+    @app_commands.guild_only()
+    @app_commands.checks.has_permissions(manage_guild=True)
+    async def set_channel_group_cmd(
+        self,
+        interaction: discord.Interaction,
+        group_name: str,
+        channels: str,
+    ):
+        """设置或更新一个频道组合名，将其映射到一组频道ID。"""
+        await interaction.response.defer(ephemeral=True)
+
+        guild = interaction.guild
+        if not guild:
+            await interaction.followup.send("此命令只能在服务器中使用。", ephemeral=True)
+            return
+
+        settings = self.bot.guild_settings_map.get(guild.id)
+        if not settings:
+            await interaction.followup.send("当前服务器未在 BOT 的 GUILD_CONFIGS_JSON 中注册，无法使用频道组合功能。", ephemeral=True)
+            return
+
+        raw_ids = re.findall(r"\d+", channels)
+        valid_channel_ids: list[int] = []
+        ignored_entries: list[str] = []
+
+        for raw in raw_ids:
+            try:
+                cid = int(raw)
+            except ValueError:
+                ignored_entries.append(raw)
+                continue
+
+            ch = guild.get_channel(cid)
+            if isinstance(ch, (TextChannel, ForumChannel)):
+                valid_channel_ids.append(ch.id)
+            else:
+                ignored_entries.append(raw)
+
+        # 去重
+        valid_channel_ids = sorted(set(valid_channel_ids))
+
+        if not valid_channel_ids:
+            await interaction.followup.send("未能解析出任何有效的文本频道或论坛频道，请检查你输入的频道。", ephemeral=True)
+            return
+
+        # 更新 / 新增频道组合
+        if not hasattr(settings, "channel_groups") or settings.channel_groups is None:
+            settings.channel_groups = {}
+
+        settings.channel_groups[group_name] = valid_channel_ids
+        await self.bot.save_guild_setting(settings.guild_id)
+
+        embed = Embed(title="频道组合已保存", color=Color.green())
+        embed.add_field(name="组合名", value=group_name, inline=False)
+
+        lines = []
+        for cid in valid_channel_ids:
+            ch = guild.get_channel(cid)
+            if ch is not None:
+                lines.append(f"{ch.mention} (`{cid}`)")
+            else:
+                lines.append(f"`{cid}` (已不在本服务器)")
+
+        embed.add_field(name="包含频道", value="\n".join(lines), inline=False)
+
+        if ignored_entries:
+            ignored_text = ", ".join(set(ignored_entries))
+            embed.add_field(name="已忽略的无效输入", value=ignored_text, inline=False)
+
+        await interaction.followup.send(embed=embed, ephemeral=True)
+        bot_log.info(f"用户 {interaction.user} 在服务器 {guild.id} 设置频道组合 '{group_name}' -> {valid_channel_ids}。")
+
+    @app_commands.command(name="delete-channel-group", description="删除一个已保存的频道组合。")
+    @app_commands.describe(group_name="要删除的频道组合名称")
+    @app_commands.default_permissions(manage_guild=True)
+    @app_commands.guild_only()
+    @app_commands.checks.has_permissions(manage_guild=True)
+    async def delete_channel_group_cmd(
+        self,
+        interaction: discord.Interaction,
+        group_name: str,
+    ):
+        """删除一个已保存的频道组合名。"""
+        await interaction.response.defer(ephemeral=True)
+
+        guild = interaction.guild
+        if not guild:
+            await interaction.followup.send("此命令只能在服务器中使用。", ephemeral=True)
+            return
+
+        settings = self.bot.guild_settings_map.get(guild.id)
+        if not settings or not getattr(settings, "channel_groups", None):
+            await interaction.followup.send("当前服务器尚未配置任何频道组合。", ephemeral=True)
+            return
+
+        if group_name not in settings.channel_groups:
+            await interaction.followup.send(f"未找到名为 '{group_name}' 的频道组合。", ephemeral=True)
+            return
+
+        removed_ids = settings.channel_groups.pop(group_name)
+        await self.bot.save_guild_setting(settings.guild_id)
+
+        embed = Embed(title="频道组合已删除", color=Color.red())
+        embed.add_field(name="组合名", value=group_name, inline=False)
+
+        if removed_ids:
+            lines = []
+            for cid in removed_ids:
+                ch = guild.get_channel(cid)
+                if ch is not None:
+                    lines.append(f"{ch.mention} (`{cid}`)")
+                else:
+                    lines.append(f"`{cid}`")
+            embed.add_field(name="原包含频道", value="\n".join(lines), inline=False)
+
+        await interaction.followup.send(embed=embed, ephemeral=True)
+        bot_log.info(f"用户 {interaction.user} 在服务器 {guild.id} 删除频道组合 '{group_name}'。")
+
+    @app_commands.command(name="count-active-threads", description="统计指定频道或频道组合中的所有活跃帖子数。")
+    @app_commands.describe(target="频道组合名，或单个频道 ID / 频道 mention。")
+    @app_commands.guild_only()
+    async def count_active_threads_cmd(
+        self,
+        interaction: discord.Interaction,
+        target: str,
+    ):
+        """统计某个频道或频道组合下所有活跃帖子的数量。"""
+        await interaction.response.defer(ephemeral=True)
+
+        guild = interaction.guild
+        if not guild:
+            await interaction.followup.send("此命令只能在服务器中使用。", ephemeral=True)
+            return
+
+        settings = self.bot.guild_settings_map.get(guild.id)
+        if not settings:
+            await interaction.followup.send("当前服务器未在 BOT 的 GUILD_CONFIGS_JSON 中注册，无法使用频道组合功能。", ephemeral=True)
+            return
+
+        channel_ids: list[int] | None = None
+        used_group_name: str | None = None
+
+        # 1. 优先按频道组合名匹配
+        if getattr(settings, "channel_groups", None) and target in settings.channel_groups:
+            used_group_name = target
+            channel_ids = settings.channel_groups[target]
+        else:
+            # 2. 尝试解析为频道 ID 或频道 mention
+            match = re.search(r"\d+", target)
+            if not match:
+                await interaction.followup.send("未找到同名频道组合，也无法从输入中解析出频道 ID。", ephemeral=True)
+                return
+
+            try:
+                cid = int(match.group())
+            except ValueError:
+                await interaction.followup.send("无法解析出有效的频道 ID。", ephemeral=True)
+                return
+
+            ch = guild.get_channel(cid)
+            if not isinstance(ch, (TextChannel, ForumChannel)):
+                await interaction.followup.send("解析出的频道 ID 不对应有效的文本频道或论坛频道。", ephemeral=True)
+                return
+
+            channel_ids = [ch.id]
+
+        # 去重并过滤空值
+        target_channel_ids = {int(cid) for cid in channel_ids or []}
+
+        if not target_channel_ids:
+            await interaction.followup.send("目标频道列表为空，无法统计活跃帖子。", ephemeral=True)
+            return
+
+        try:
+            active_threads = await guild.active_threads()
+        except discord.Forbidden:
+            await interaction.followup.send("BOT 没有权限查看本服务器的活跃帖子列表，请检查权限。", ephemeral=True)
+            return
+        except Exception as e:
+            bot_log.error(f"获取服务器 {guild.id} 活跃帖子失败: {e}", exc_info=True)
+            await interaction.followup.send("获取活跃帖子列表时发生未知错误，请稍后再试。", ephemeral=True)
+            return
+
+        threads_for_target: list[Thread] = [
+            t for t in active_threads if t.parent_id in target_channel_ids
+        ]
+        total_count = len(threads_for_target)
+
+        per_channel_counts: dict[int, int] = {}
+        for thread in threads_for_target:
+            if thread.parent_id is None:
+                continue
+            per_channel_counts[thread.parent_id] = per_channel_counts.get(thread.parent_id, 0) + 1
+
+        embed = Embed(title="活跃帖子统计", color=Color.blue())
+
+        if used_group_name:
+            embed.add_field(name="目标类型", value=f"频道组合：**{used_group_name}**", inline=False)
+        else:
+            cid = next(iter(target_channel_ids))
+            ch = guild.get_channel(cid)
+            channel_repr = ch.mention if ch is not None else f"`{cid}`"
+            embed.add_field(name="目标类型", value=f"单个频道：{channel_repr}", inline=False)
+
+        embed.add_field(name="总活跃帖子数", value=str(total_count), inline=False)
+
+        if per_channel_counts:
+            lines = []
+            for cid, cnt in per_channel_counts.items():
+                ch = guild.get_channel(cid)
+                if ch is not None:
+                    lines.append(f"{ch.mention}: **{cnt}**")
+                else:
+                    lines.append(f"`{cid}`: **{cnt}**")
+            embed.add_field(name="各频道明细", value="\n".join(lines), inline=False)
+
+        await interaction.followup.send(embed=embed, ephemeral=True)
+        bot_log.info(f"用户 {interaction.user} 在服务器 {guild.id} 查询目标 '{target}' 的活跃帖子数，总计 {total_count}。")
 
 # --- 主程序入口 ---
 def main_bot_runner():
