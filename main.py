@@ -14,7 +14,6 @@ from discord.ext import commands, tasks
 from discord import app_commands, Intents, Guild, TextChannel, Thread, Message, Embed, Color, ForumChannel, CategoryChannel 
 
 # --- 全局配置与常量 ---
-CONFIG_FILENAME = "bot_config.json"
 LOG_DIRECTORY = Path("logs")
 LOG_FILENAME = LOG_DIRECTORY / "archiver_bot.log"
 DATA_DIRECTORY = Path("data")
@@ -66,6 +65,7 @@ class GuildArchiveSettings:
         channel_groups: dict[str, list[int]] | None = None,
         last_notice_message_id: int | None = None,
         pinned_thread_moderation: dict | None = None,
+        protected_channel_ids: list[int] | None = None,
     ):
         self.guild_id = guild_id
         self.config_name = config_name
@@ -73,8 +73,11 @@ class GuildArchiveSettings:
         self.blacklist_channel_ids = [int(channel_id) for channel_id in (blacklist_channel_ids or [])]
         # 优先归档频道：同等条件下优先归档（不受活跃度排序影响）
         self.priority_channel_ids = [int(channel_id) for channel_id in (priority_channel_ids or [])]
+        # 新帖保护频道：这些频道中的帖子在创建后的若干天内不会被自动归档
+        self.protected_channel_ids = [int(channel_id) for channel_id in (protected_channel_ids or [])]
         self.archive_category_id = archive_category_id
-        self.inactivity_days = inactivity_days
+        # 使用 inactivity_days 作为“新帖保护天数”：仅当频道在 protected_channel_ids 中时生效
+        self.inactivity_days = max(inactivity_days, 0)
         self.notification_thread_id = notification_thread_id
         self.max_active_posts = max_active_posts
         self.max_active_threads = max_active_threads
@@ -104,6 +107,7 @@ class GuildArchiveSettings:
             "guild_id": self.guild_id,
             "blacklist_channel_ids": self.blacklist_channel_ids,
             "priority_channel_ids": self.priority_channel_ids,
+            "protected_channel_ids": self.protected_channel_ids,
             "archive_category_id": self.archive_category_id,
             "inactivity_days": self.inactivity_days,
             "notification_thread_id": self.notification_thread_id,
@@ -137,6 +141,7 @@ class GuildArchiveSettings:
             channel_groups=data.get("channel_groups") or {},
             last_notice_message_id=data.get("last_notice_message_id"),
             pinned_thread_moderation=data.get("pinned_thread_moderation"),
+            protected_channel_ids=data.get("protected_channel_ids", []),
         )
 
 class ErrorMessage: 
@@ -508,8 +513,6 @@ class ThreadArchiverBot(commands.Bot):
         initial_log_info = ""
         overall_summary_embed_description = ""
         global_start_time = time.time()
-        overall_summary_embed_description += f"> 不活跃 **{settings.inactivity_days}** 天归档：**{'开启' if settings.inactivity_days > 0 else '关闭'}**\n"
-        initial_log_info += f"> 不活跃 **{settings.inactivity_days}** 天归档: {'开启' if settings.inactivity_days > 0 else '关闭'}\n"
 
         blacklist_count = len(settings.blacklist_channel_ids)
         if blacklist_count > 0:
@@ -525,6 +528,14 @@ class ThreadArchiverBot(commands.Bot):
             initial_log_info += f"已配置 {priority_count} 个优先归档频道，这些频道中的帖子将优先被归档处理。\n"
         else:
             overall_summary_embed_description += f"> 未配置优先归档频道。\n"
+
+        protected_count = len(getattr(settings, "protected_channel_ids", []))
+        if settings.inactivity_days > 0 and protected_count > 0:
+            overall_summary_embed_description += f"> 新帖保护: **启用**（保护频道 {protected_count} 个，新帖 {settings.inactivity_days} 天内不被归档）\n"
+            initial_log_info += f"已为 {protected_count} 个频道启用新帖保护：帖子创建后 {settings.inactivity_days} 天内不会被自动归档。\n"
+        else:
+            overall_summary_embed_description += f"> 新帖保护: **未启用**\n"
+            initial_log_info += "未启用新帖保护或未配置保护频道。\n"
 
         overall_summary_embed_description += "\n"
 
@@ -627,6 +638,8 @@ class ThreadArchiverBot(commands.Bot):
             # 黑名单频道内的帖子计入活跃总数，但不会作为归档候选
             blacklisted_parent_ids_set = set(settings.blacklist_channel_ids)
             priority_parent_ids_set = set(settings.priority_channel_ids)
+            protected_parent_ids_set = set(getattr(settings, "protected_channel_ids", []))
+            protection_days = getattr(settings, "inactivity_days", 0)
             priority_candidate_count = 0
 
             for thread_obj in all_server_active_threads_list:
@@ -648,6 +661,23 @@ class ThreadArchiverBot(commands.Bot):
                 thread_message_obj_list_server_level = await self._get_last_message_task(candidate_threads_for_server_kill)
                 get_msg_time = time.time() - get_msg_start
                 initial_log_info += f"\n  获取候选帖子 最后一条消息 耗时: {get_msg_time:.3f}s (S:{self.message_succeed_count}/F:{self.not_found_error_count})"
+
+                protected_skipped_count = 0
+                if protection_days > 0 and protected_parent_ids_set:
+                    now_utc_for_protection = datetime.now(timezone.utc)
+                    protection_delta = timedelta(days=protection_days)
+                    filtered_thread_messages = []
+                    for tm_obj in thread_message_obj_list_server_level:
+                        if tm_obj.thread.parent_id in protected_parent_ids_set:
+                            baseline_dt = tm_obj.thread.created_at
+                            if baseline_dt is None and hasattr(tm_obj.last_message, "created_at"):
+                                baseline_dt = tm_obj.last_message.created_at
+                            if baseline_dt is not None and (now_utc_for_protection - baseline_dt) < protection_delta:
+                                protected_skipped_count += 1
+                                continue
+                        filtered_thread_messages.append(tm_obj)
+                    thread_message_obj_list_server_level = filtered_thread_messages
+                    initial_log_info += f"\n  已跳过 {protected_skipped_count} 个处于新帖保护期的帖子。"
 
                 def _normalize_dt(dt: datetime) -> datetime:
                     if not isinstance(dt, datetime):
@@ -685,61 +715,7 @@ class ThreadArchiverBot(commands.Bot):
 
         bot_log.info(initial_log_info)
 
-        # --- 步骤 4: 基于频道的不活跃天数归档---
-        if settings.inactivity_days > 0:
-            log_inactivity_phase = "\n开始检查各非黑名单频道中的不活跃帖子..."
-
-            blacklisted_forum_channel_ids_set = set(settings.blacklist_channel_ids)
-
-            # 从之前获取的全服务器活跃帖子中筛选出仍在非黑名单频道内且仍然活跃（未被服务器级归档）的帖子
-            active_threads_for_inactivity_check = []
-            priority_parent_ids_set = set(settings.priority_channel_ids)
-
-            for t_obj in all_server_active_threads_list:
-                if (
-                    t_obj.parent_id not in blacklisted_forum_channel_ids_set
-                    and t_obj.id not in pinned_threads_set_server_wide
-                    and not t_obj.archived
-                    and not t_obj.locked
-                ):
-                    active_threads_for_inactivity_check.append(t_obj)
-
-            if active_threads_for_inactivity_check:
-                log_inactivity_phase += f"\n  找到 {len(active_threads_for_inactivity_check)} 个在非黑名单频道中的活跃、非置顶帖进行不活跃检查"
-
-                get_msg_start_ia = time.time()
-                current_msg_succeed = self.message_succeed_count
-                current_msg_fail = self.not_found_error_count
-                thread_message_obj_list_inactivity = await self._get_last_message_task(active_threads_for_inactivity_check)
-                get_msg_time_ia = time.time() - get_msg_start_ia
-                log_inactivity_phase += f"\n  获取不活跃检查帖子的最后一条消息耗时: {get_msg_time_ia:.3f}s (S:{self.message_succeed_count-current_msg_succeed}/F:{self.not_found_error_count-current_msg_fail})"
-
-                threads_to_archive_due_to_inactivity = []
-                now_utc_naive = datetime.now(timezone.utc).replace(tzinfo=None)
-                inactivity_threshold_date = now_utc_naive - timedelta(days=settings.inactivity_days)
-
-                for tm_obj in thread_message_obj_list_inactivity:
-                    last_activity_naive = tm_obj.last_message.created_at.replace(tzinfo=None)
-
-                    if last_activity_naive < inactivity_threshold_date:
-                        threads_to_archive_due_to_inactivity.append(tm_obj)
-
-                log_inactivity_phase += f"\n  找到 {len(threads_to_archive_due_to_inactivity)} 个帖子因不活跃需要归档"
-
-                if threads_to_archive_due_to_inactivity:
-                    archive_task_start_time_ia = time.time()
-                    initial_succeed_count_ia = self.succeed_count
-                    initial_fail_count_ia = self.fail_count
-                    await self._archive_thread_task(threads_to_archive_due_to_inactivity, settings)
-                    threads_archived_this_run += (self.succeed_count - initial_succeed_count_ia)
-                    archive_task_time_ia = time.time() - archive_task_start_time_ia
-                    log_inactivity_phase += f"\n  不活跃帖子归档操作耗时: {archive_task_time_ia:.3f}s (成功:{self.succeed_count - initial_succeed_count_ia}, 失败:{self.fail_count - initial_fail_count_ia})"
-            else:
-                log_inactivity_phase += "\n  没有在监控频道中找到需要进行不活跃检查的帖子。"
-
-            bot_log.info(log_inactivity_phase)
-
-        # --- 步骤 5: 日志与面板信息整理---
+        # --- 步骤 4: 日志与面板信息整理 ---
         global_finish_time = time.time()
         log_result_summary = f"\n--- 运行总结 (索引: {run_hash_value}) ---"
         log_result_summary += f"\n总计成功归档帖子: {self.succeed_count}"
@@ -1040,10 +1016,10 @@ class ArchiveManagerCog(commands.Cog):
     def __init__(self, bot: ThreadArchiverBot):
         self.bot = bot
 
-    @app_commands.command(name="set-archive-rules", description="设置当前服务器的归档规则（不活跃天数、活跃帖数量等）。")
+    @app_commands.command(name="set-archive-rules", description="设置当前服务器的归档规则（新帖保护天数、活跃帖数量等）。")
     @app_commands.describe(
         config_name="在环境变量 GUILD_CONFIGS_JSON 中定义的服务器配置名",
-        inactivity_days="帖子多少天不活跃后自动归档 (0 表示关闭按天归档；留空则不修改)",
+        inactivity_days="新帖保护天数：在受保护频道中，帖子创建后多少天内不会因为超出服务器活跃帖上限而被归档 (0 表示关闭保护；留空则不修改)",
         max_active_posts="频道内最大活跃帖子数上限 (0 表示不限制；当前仍未在逻辑中使用，仅预留；留空则不修改)",
         max_active_threads="整个服务器允许的最大活跃帖子数上限 (0 表示不限制；留空则不修改)"
     )
@@ -1086,7 +1062,7 @@ class ArchiveManagerCog(commands.Cog):
 
         if inactivity_days is not None:
             target_setting.inactivity_days = max(inactivity_days, 0)
-            changed_fields.append("不活跃归档天数")
+            changed_fields.append("新帖保护天数")
 
         if max_active_posts is not None:
             target_setting.max_active_posts = max(max_active_posts, 0)
@@ -1101,7 +1077,7 @@ class ArchiveManagerCog(commands.Cog):
         embed = Embed(title="归档规则已更新", color=Color.green())
         embed.description = (
             f"服务器配置 **{config_name}** 的规则已更新：\n"
-            f"- 不活跃归档天数: **{target_setting.inactivity_days if target_setting.inactivity_days > 0 else '未启用'}** 天\n"
+            f"- 新帖保护天数: **{target_setting.inactivity_days if target_setting.inactivity_days > 0 else '未启用'}** 天\n"
             f"- 频道最大活跃帖数: **{target_setting.max_active_posts if target_setting.max_active_posts > 0 else '未启用'}**\n"
             f"- 服务器最大活跃帖数: **{target_setting.max_active_threads if target_setting.max_active_threads > 0 else '未启用'}**"
         )
@@ -1110,7 +1086,7 @@ class ArchiveManagerCog(commands.Cog):
         changed_desc = "，".join(changed_fields) if changed_fields else "无"
         bot_log.info(f"用户 {interaction.user} 更新了 '{config_name}' 的归档规则: {changed_desc}。")
 
-    @app_commands.command(name="manual-guild-archive", description="手动触发一次归档审计（服务器级 + 不活跃检查）。")
+    @app_commands.command(name="manual-guild-archive", description="手动触发一次归档审计（服务器级审计，包含新帖保护规则）。")
     @app_commands.describe(config_name="在 GUILD_CONFIGS_JSON 中配置的服务器别名")
     @app_commands.default_permissions(manage_guild=True)
     @app_commands.guild_only()
@@ -1189,11 +1165,14 @@ class ArchiveManagerCog(commands.Cog):
                 channel_groups_desc = "\n".join(lines)
             embed.add_field(name="频道组合", value=channel_groups_desc, inline=False)
 
-            inactivity_days_str = f"{setting.inactivity_days} 天" if setting.inactivity_days > 0 else "未启用"
+            protected_channels_value = ", ".join(map(str, getattr(setting, "protected_channel_ids", []))) or "未设置"
+            embed.add_field(name="新帖保护频道ID", value=protected_channels_value, inline=False)
+
+            protection_days_str = f"{setting.inactivity_days} 天" if setting.inactivity_days > 0 else "未启用"
             max_posts_str = str(setting.max_active_posts) if setting.max_active_posts > 0 else "未启用"
             max_active_threads = str(setting.max_active_threads) if setting.max_active_threads > 0 else "未启用"
 
-            embed.add_field(name="不活跃天数", value=inactivity_days_str, inline=True)
+            embed.add_field(name="新帖保护天数", value=protection_days_str, inline=True)
             embed.add_field(name="最大活跃帖数", value=max_posts_str, inline=True)
             embed.add_field(name="服务器最大活跃帖数", value=max_active_threads, inline=True)
             embed.add_field(name="通知频道/帖子ID", value=str(setting.notification_thread_id) if setting.notification_thread_id else "未设置", inline=False)
