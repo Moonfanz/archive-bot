@@ -1023,15 +1023,26 @@ class ArchiveManagerCog(commands.Cog):
     @app_commands.command(name="set-archive-rules", description="设置当前服务器的归档规则（不活跃天数、活跃帖数量等）。")
     @app_commands.describe(
         config_name="在环境变量 GUILD_CONFIGS_JSON 中定义的服务器配置名",
-        inactivity_days="帖子多少天不活跃后自动归档 (0 表示关闭按天归档)",
-        max_active_posts="频道内最大活跃帖子数上限 (0 表示不限制；当前仍未在逻辑中使用，仅预留)",
-        max_active_threads="整个服务器允许的最大活跃帖子数上限"
+        inactivity_days="帖子多少天不活跃后自动归档 (0 表示关闭按天归档；留空则不修改)",
+        max_active_posts="频道内最大活跃帖子数上限 (0 表示不限制；当前仍未在逻辑中使用，仅预留；留空则不修改)",
+        max_active_threads="整个服务器允许的最大活跃帖子数上限 (0 表示不限制；留空则不修改)"
     )
     @app_commands.default_permissions(manage_guild=True)
     @app_commands.guild_only()
     @app_commands.checks.has_permissions(manage_guild=True)
-    async def set_archive_rules_cmd(self, interaction: discord.Interaction,
-                                    config_name: str, inactivity_days: int, max_active_posts: int, max_active_threads: int):
+    async def set_archive_rules_cmd(
+        self,
+        interaction: discord.Interaction,
+        config_name: str,
+        inactivity_days: int | None = None,
+        max_active_posts: int | None = None,
+        max_active_threads: int | None = None,
+    ):
+        """更新指定服务器配置的归档规则。
+        
+        - 参数留空则对应字段不修改
+        - 传入 0 或负数则视为“关闭/未启用”
+        """
         await interaction.response.defer(ephemeral=True)
 
         target_setting: GuildArchiveSettings | None = None
@@ -1047,8 +1058,23 @@ class ArchiveManagerCog(commands.Cog):
             await interaction.followup.send(f"错误：未找到名为 '{config_name}' 的服务器配置。", ephemeral=True)
             return
 
-        target_setting.inactivity_days = inactivity_days if inactivity_days >= 0 else target_setting.inactivity_days
-        target_setting.max_active_posts = max_active_posts if max_active_posts >= 0 else target_setting.max_active_posts
+        if inactivity_days is None and max_active_posts is None and max_active_threads is None:
+            await interaction.followup.send("未提供任何需要更新的参数，请至少填写一个。", ephemeral=True)
+            return
+
+        changed_fields: list[str] = []
+
+        if inactivity_days is not None:
+            target_setting.inactivity_days = max(inactivity_days, 0)
+            changed_fields.append("不活跃归档天数")
+
+        if max_active_posts is not None:
+            target_setting.max_active_posts = max(max_active_posts, 0)
+            changed_fields.append("频道最大活跃帖数")
+
+        if max_active_threads is not None:
+            target_setting.max_active_threads = max(max_active_threads, 0)
+            changed_fields.append("服务器最大活跃帖数")
 
         await self.bot.save_guild_setting(guild_id_to_update)
 
@@ -1056,10 +1082,13 @@ class ArchiveManagerCog(commands.Cog):
         embed.description = (
             f"服务器配置 **{config_name}** 的规则已更新：\n"
             f"- 不活跃归档天数: **{target_setting.inactivity_days if target_setting.inactivity_days > 0 else '未启用'}** 天\n"
-            f"- 最大活跃帖子数: **{target_setting.max_active_posts if target_setting.max_active_posts > 0 else '未启用'}**"
+            f"- 频道最大活跃帖数: **{target_setting.max_active_posts if target_setting.max_active_posts > 0 else '未启用'}**\n"
+            f"- 服务器最大活跃帖数: **{target_setting.max_active_threads if target_setting.max_active_threads > 0 else '未启用'}**"
         )
         await interaction.followup.send(embed=embed, ephemeral=True)
-        bot_log.info(f"用户 {interaction.user} 更新了 '{config_name}' 的归档规则。")
+
+        changed_desc = "，".join(changed_fields) if changed_fields else "无"
+        bot_log.info(f"用户 {interaction.user} 更新了 '{config_name}' 的归档规则: {changed_desc}。")
 
     @app_commands.command(name="manual-guild-archive", description="手动触发一次归档审计（服务器级 + 不活跃检查）。")
     @app_commands.describe(config_name="在 GUILD_CONFIGS_JSON 中配置的服务器别名")
