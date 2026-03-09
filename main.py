@@ -17,6 +17,7 @@ from discord import app_commands, Intents, Guild, TextChannel, Thread, Message, 
 LOG_DIRECTORY = Path("logs")
 LOG_FILENAME = LOG_DIRECTORY / "archiver_bot.log"
 DATA_DIRECTORY = Path("data")
+ARCHIVE_TOP_LINK_MARKER = "ARCHIVER_TOP_LINK"
 
 # 加载环境变量
 from dotenv import load_dotenv
@@ -184,6 +185,10 @@ class ThreadArchiverBot(commands.Bot):
         self.pinned_last_messages: dict[int, int] = {}
         self.pinned_messages_lock = asyncio.Lock()
 
+        self.ARCHIVE_TOP_LINK_MESSAGES_FILE = DATA_DIRECTORY / "archive_top_link_messages.json"
+        self.archive_top_link_messages: dict[int, int] = {}
+        self.archive_top_link_messages_lock = asyncio.Lock()
+
         self.succeed_count = 0
         self.fail_count = 0
         self.message_succeed_count = 0
@@ -192,6 +197,7 @@ class ThreadArchiverBot(commands.Bot):
         self.log_archived_info_details = ""
         self.log_archived_error_details = ""
         self.archive_run_details_for_embed = {}
+        self.archived_success_details_for_embed: list[tuple[str, str]] = []
 
     async def load_configuration(self):
         """加载配置（从环境变量 GUILD_CONFIGS_JSON）"""
@@ -333,6 +339,18 @@ class ThreadArchiverBot(commands.Bot):
         except Exception as e:
             bot_log.error(f"加载置顶帖消息记录失败: {e}", exc_info=True)
 
+    def _load_archive_top_link_messages(self):
+        """同步加载归档前回顶消息记录"""
+        try:
+            with open(self.ARCHIVE_TOP_LINK_MESSAGES_FILE, 'r', encoding='utf-8') as f:
+                data = json.load(f)
+                self.archive_top_link_messages = {int(k): int(v) for k, v in data.items()}
+                bot_log.info(f"成功加载了 {len(self.archive_top_link_messages)} 条归档回顶消息记录。")
+        except FileNotFoundError:
+            bot_log.info("归档回顶消息记录文件未找到，将创建新的。")
+        except Exception as e:
+            bot_log.error(f"加载归档回顶消息记录失败: {e}", exc_info=True)
+
     async def _save_pinned_last_messages(self):
         """保存置顶帖最后消息ID记录到文件"""
         async with self.pinned_messages_lock:
@@ -342,6 +360,16 @@ class ThreadArchiverBot(commands.Bot):
                     json.dump(data, f, indent=4)
             except Exception as e:
                 bot_log.error(f"保存置顶帖消息记录失败: {e}", exc_info=True)
+
+    async def _save_archive_top_link_messages(self):
+        """保存归档回顶消息ID记录到文件"""
+        async with self.archive_top_link_messages_lock:
+            try:
+                data = {str(k): v for k, v in self.archive_top_link_messages.items()}
+                with open(self.ARCHIVE_TOP_LINK_MESSAGES_FILE, 'w', encoding='utf-8') as f:
+                    json.dump(data, f, indent=4)
+            except Exception as e:
+                bot_log.error(f"保存归档回顶消息记录失败: {e}", exc_info=True)
 
     async def _save_bump_records(self):
         """将内存中的刷新记录保存到文件"""
@@ -364,6 +392,7 @@ class ThreadArchiverBot(commands.Bot):
         """Bot启动时的异步设置"""
         self._load_bump_records()
         self._load_pinned_last_messages()
+        self._load_archive_top_link_messages()
         await self.load_configuration()
         await self.add_cog(ArchiveManagerCog(self))
     
@@ -509,6 +538,7 @@ class ThreadArchiverBot(commands.Bot):
         self.log_archived_info_details = ""
         self.log_archived_error_details = ""
         self.archive_run_details_for_embed = {}
+        self.archived_success_details_for_embed = []
 
         initial_log_info = ""
         overall_summary_embed_description = ""
@@ -516,16 +546,16 @@ class ThreadArchiverBot(commands.Bot):
 
         blacklist_count = len(settings.blacklist_channel_ids)
         if blacklist_count > 0:
-            overall_summary_embed_description += f"> 黑名单频道数: **{blacklist_count}**（这些频道中的帖子不会被自动归档）\n"
-            initial_log_info += f"已配置 {blacklist_count} 个黑名单频道，这些频道中的帖子不会被自动归档。\n"
+            overall_summary_embed_description += f"> 黑名单频道数: **{blacklist_count}**\n"
+            initial_log_info += f"已配置 {blacklist_count} 个黑名单频道。\n"
         else:
-            overall_summary_embed_description += f"> 未配置黑名单频道，默认对所有频道执行归档策略\n"
-            initial_log_info += "未配置黑名单频道，将对所有频道执行归档策略。\n"
+            overall_summary_embed_description += f"> 未配置黑名单频道\n"
+            initial_log_info += "未配置黑名单频道。\n"
 
         priority_count = len(settings.priority_channel_ids)
         if priority_count > 0:
-            overall_summary_embed_description += f"> 优先归档频道数: **{priority_count}**（这些频道中的帖子优先被处理）\n"
-            initial_log_info += f"已配置 {priority_count} 个优先归档频道，这些频道中的帖子将优先被归档处理。\n"
+            overall_summary_embed_description += f"> 优先归档频道数: **{priority_count}**\n"
+            initial_log_info += f"已配置 {priority_count} 个优先归档频道。\n"
         else:
             overall_summary_embed_description += f"> 未配置优先归档频道。\n"
 
@@ -616,7 +646,7 @@ class ThreadArchiverBot(commands.Bot):
 
         pinned_server_wide_count = len(pinned_threads_set_server_wide)
         initial_log_info += f"\n全服务器置顶帖子数: **{pinned_server_wide_count}**"
-        overall_summary_embed_description += f"> 全服置顶帖: {pinned_server_wide_count}\n"
+        overall_summary_embed_description += f"> 全服置顶帖: **{pinned_server_wide_count}**\n"
         
         # --- 置顶帖消息审计 ---
         if settings.pinned_mod_enabled and pinned_server_wide_count > 0:
@@ -742,12 +772,22 @@ class ThreadArchiverBot(commands.Bot):
         final_embed = Embed(title=f"归档报告: {settings.config_name}", description=overall_summary_embed_description, color=final_embed_color)
         final_embed.set_author(name=current_run_timestamp_str)
 
-        if self.archive_run_details_for_embed:
+        selected_archive_details: list[tuple[str, str]] = []
+        if self.archived_success_details_for_embed:
+            if len(self.archived_success_details_for_embed) <= 10:
+                selected_archive_details = self.archived_success_details_for_embed
+            else:
+                selected_archive_details = (
+                    self.archived_success_details_for_embed[:5]
+                    + self.archived_success_details_for_embed[-5:]
+                )
+
+        if selected_archive_details:
             details_text_parts = []
             current_length = 0
             max_field_length = 1000
 
-            for title, desc in self.archive_run_details_for_embed.items():
+            for title, desc in selected_archive_details:
                 part = f"**{title}**\n{desc}\n"
                 if current_length + len(part) > max_field_length and details_text_parts:
                     final_embed.add_field(name="部分归档详情", value="".join(details_text_parts), inline=False)
@@ -835,6 +875,93 @@ class ThreadArchiverBot(commands.Bot):
             await asyncio.sleep(0.05)
 
         await asyncio.gather(*tasks_list)
+
+    def _build_archive_top_link_url(self, thread: discord.Thread) -> str:
+        """构造带 /0 的帖子顶部链接。"""
+        return f"https://discord.com/channels/{thread.guild.id}/{thread.id}/0"
+
+    def _is_archive_top_link_message(self, message: discord.Message) -> bool:
+        """判断消息是否为机器人发送的归档回顶消息。"""
+        if not self.user or message.author.id != self.user.id:
+            return False
+
+        if message.embeds:
+            for embed in message.embeds:
+                footer_text = embed.footer.text if embed.footer else None
+                if footer_text == ARCHIVE_TOP_LINK_MARKER:
+                    return True
+
+        return message.content.strip() == ARCHIVE_TOP_LINK_MARKER
+
+    async def _delete_existing_archive_top_link_message(self, thread: discord.Thread) -> tuple[int, int]:
+        """删除线程中旧的归档回顶消息。
+
+        返回 (按记录删除数, 按历史扫描删除数)。
+        """
+        deleted_from_record = 0
+        deleted_from_scan = 0
+        stored_message_id = self.archive_top_link_messages.get(thread.id)
+
+        if stored_message_id:
+            try:
+                stored_message = await thread.fetch_message(stored_message_id)
+                if self._is_archive_top_link_message(stored_message):
+                    await stored_message.delete()
+                    deleted_from_record = 1
+            except discord.NotFound:
+                pass
+            except discord.Forbidden:
+                raise
+            except Exception as e:
+                bot_log.warning(f"按记录删除帖子 {thread.id} 的旧回顶消息失败: {e}")
+
+        try:
+            async for message in thread.history(limit=50):
+                if not self._is_archive_top_link_message(message):
+                    continue
+
+                if stored_message_id and message.id == stored_message_id and deleted_from_record:
+                    continue
+
+                await message.delete()
+                deleted_from_scan += 1
+        except discord.Forbidden:
+            raise
+        except Exception as e:
+            bot_log.warning(f"扫描删除帖子 {thread.id} 的旧回顶消息失败: {e}")
+
+        if deleted_from_record or deleted_from_scan or stored_message_id:
+            self.archive_top_link_messages.pop(thread.id, None)
+            await self._save_archive_top_link_messages()
+
+        return deleted_from_record, deleted_from_scan
+
+    async def _send_archive_top_link_message(self, thread: discord.Thread) -> discord.Message:
+        """发送新的归档回顶消息。"""
+        top_link = self._build_archive_top_link_url(thread)
+        embed = Embed(
+            title="🚀 一键回到顶部",
+            description="点击下方按钮即可瞬间传送到顶部。",
+            color=Color.blue(),
+        )
+        embed.set_footer(text=ARCHIVE_TOP_LINK_MARKER)
+
+        view = discord.ui.View()
+        view.add_item(discord.ui.Button(label="回到帖子顶部", url=top_link))
+
+        sent_message = await thread.send(embed=embed, view=view)
+        self.archive_top_link_messages[thread.id] = sent_message.id
+        await self._save_archive_top_link_messages()
+        return sent_message
+
+    async def _prepare_archive_top_link_message(self, thread: discord.Thread) -> str:
+        """在归档前更新非优先频道帖子的回顶消息。"""
+        deleted_from_record, deleted_from_scan = await self._delete_existing_archive_top_link_message(thread)
+        sent_message = await self._send_archive_top_link_message(thread)
+        return (
+            f"回顶消息已更新: 删除旧消息 {deleted_from_record + deleted_from_scan} 条，"
+            f"新消息ID {sent_message.id}"
+        )
 
     async def _audit_pinned_thread_messages(self, guild: Guild, settings: GuildArchiveSettings, pinned_thread_ids: set[int]) -> str:
         """审计置顶帖中的漏监听消息"""
@@ -948,16 +1075,12 @@ class ThreadArchiverBot(commands.Bot):
                 audit_desc = f"> 处理时发生错误: {e}"
                 audit_details.append((audit_key, audit_desc))
         
-        # 将审计详情添加到embed字段
-        for audit_key, audit_desc in audit_details:
-            if len(self.archive_run_details_for_embed) < 10:
-                self.archive_run_details_for_embed[audit_key] = audit_desc
-        
         log_info += f"\n  审计完成: 检查了 {checked_count} 个置顶帖，删除了 {deleted_count} 条消息"
         return log_info
 
     async def _archive_thread(self, thread: discord.Thread, last_msg_obj: discord.Message | ErrorMessage, settings: GuildArchiveSettings):
         archive_reason = f"自动归档"
+        preparation_log = None
 
         if isinstance(last_msg_obj, ErrorMessage):
             created_at_str = thread.created_at.strftime('%Y-%m-%d %H:%M') if thread.created_at else "未知时间"
@@ -983,6 +1106,9 @@ class ThreadArchiverBot(commands.Bot):
             action_taken = False
             start_time = time.time()
 
+            if thread.parent_id not in set(settings.priority_channel_ids):
+                preparation_log = await self._prepare_archive_top_link_message(thread)
+
             # 实际归档操作
             if not thread.archived:
                 await thread.edit(archived=True, reason=archive_reason)
@@ -991,13 +1117,16 @@ class ThreadArchiverBot(commands.Bot):
             if action_taken or thread.archived:
                 self.succeed_count += 1
                 log_line = f"\n  - [{self.succeed_count}] {thread.name} | {thread.id} | 最后活跃时间: {last_message_time_str} ({hours_diff_str})"
+                if preparation_log:
+                    log_line += f" | {preparation_log}"
                 self.log_archived_info_details += log_line
 
                 embed_title_key = f"[T{self.succeed_count}] 归档成功↓"
                 embed_value_desc = f"> {thread.mention}\n> 最后活跃时间: {last_message_time_str} ({days_diff_str})"
+                if preparation_log:
+                    embed_value_desc += f"\n> {preparation_log}"
 
-                if len(self.archive_run_details_for_embed) < 10:
-                    self.archive_run_details_for_embed[embed_title_key] = embed_value_desc #
+                self.archived_success_details_for_embed.append((embed_title_key, embed_value_desc))
 
         except Exception as e:
             self.fail_count += 1
@@ -1005,10 +1134,6 @@ class ThreadArchiverBot(commands.Bot):
             self.log_archived_error_details += log_line
             embed_title_key = f"[E{self.fail_count}] 归档失败"
             embed_value_desc = f"- ID:{thread.id} {thread.mention}\n- 最后一条消息: {last_message_time_str} ({hours_diff_str})\n- 错误: {str(e)[:100]}"
-
-            if len(self.archive_run_details_for_embed) < 10:
-                 self.archive_run_details_for_embed[embed_title_key] = embed_value_desc
-
             bot_log.error(f"归档帖子 {thread.name} (ID:{thread.id}) 失败: {e}", exc_info=False)
 
 # --- 命令管理 ---
