@@ -133,8 +133,7 @@ class ThreadMessage:
 class ThreadArchiverBot(commands.Bot):
     def __init__(self):
         intents = Intents.default()
-        intents.message_content = True
-        intents.members = True
+        # 默认不启用任何特权 Intent，普通消息事件仍保持启用。
         intents.guilds = True
 
         super().__init__(command_prefix=commands.when_mentioned_or("!archiver "), intents=intents)
@@ -879,6 +878,18 @@ class ThreadArchiverBot(commands.Bot):
                             
                             if self._is_user_exempt(author, thread, settings):
                                 continue
+
+                            # 历史消息可能只有 User，先查询成员身份再判断角色豁免。
+                            if not isinstance(author, discord.Member):
+                                try:
+                                    author = await guild.fetch_member(author.id)
+                                except discord.HTTPException as e:
+                                    bot_log.warning(
+                                        f"无法确认用户 {author.id} 的成员权限，跳过删除消息 {message.id}: {e}"
+                                    )
+                                    continue
+                                if self._is_user_exempt(author, thread, settings):
+                                    continue
                             
                             # 删除消息
                             try:
