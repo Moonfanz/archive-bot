@@ -34,11 +34,11 @@ LOG_DIRECTORY = Path("logs")
 LOG_FILENAME = LOG_DIRECTORY / "archiver_bot.log"
 DATA_DIRECTORY = Path("data")
 
-# 定时巡检间隔（分钟），可在 .env 中通过 AUDIT_INTERVAL_MINUTES 覆盖，默认 5 分钟
+# 定时巡检间隔（分钟），可在 .env 中通过 AUDIT_INTERVAL_MINUTES 覆盖，默认 15 分钟
 try:
-    AUDIT_INTERVAL_MINUTES = max(1, int(os.environ.get("AUDIT_INTERVAL_MINUTES", "5")))
+    AUDIT_INTERVAL_MINUTES = max(1, int(os.environ.get("AUDIT_INTERVAL_MINUTES", "15")))
 except ValueError:
-    AUDIT_INTERVAL_MINUTES = 5
+    AUDIT_INTERVAL_MINUTES = 15
 
 # 并发请求信号量（控制同时拉取历史记录与归档操作的并发度，避免触发速率限制）
 HISTORY_FETCH_CONCURRENCY = 10
