@@ -1,56 +1,85 @@
 import asyncio
+import hashlib
 import json
 import logging
 import os
 import sys
+import time
+from collections import Counter
+from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-import time
-import hashlib
 
 import discord
+from discord import (
+     CategoryChannel,
+    Color,
+    Embed,
+    ForumChannel,
+    Guild,
+    Intents,
+    Message,
+    TextChannel,
+    Thread,
+    app_commands,
+)
 from discord.ext import commands, tasks
-from discord import app_commands, Intents, Guild, TextChannel, Thread, Message, Embed, Color, ForumChannel, CategoryChannel 
+from dotenv import load_dotenv
 
 # --- 全局配置与常量 ---
+load_dotenv()
+
 CONFIG_FILENAME = "bot_config.json"
 LOG_DIRECTORY = Path("logs")
 LOG_FILENAME = LOG_DIRECTORY / "archiver_bot.log"
 DATA_DIRECTORY = Path("data")
 
-# 加载环境变量
-from dotenv import load_dotenv
-load_dotenv()
+# 定时巡检间隔（分钟），可在 .env 中通过 AUDIT_INTERVAL_MINUTES 覆盖，默认 5 分钟
+try:
+    AUDIT_INTERVAL_MINUTES = max(1, int(os.environ.get("AUDIT_INTERVAL_MINUTES", "5")))
+except ValueError:
+    AUDIT_INTERVAL_MINUTES = 5
+
+# 并发请求信号量（控制同时拉取历史记录与归档操作的并发度，避免触发速率限制）
+HISTORY_FETCH_CONCURRENCY = 10
+ARCHIVE_EDIT_CONCURRENCY = 5
+
 
 # --- 日志配置 ---
-def setup_logging():
-    """配置日志记录器"""
+def setup_logging() -> logging.Logger:
+    """配置日志记录器（防止重复挂载 Handler）"""
     LOG_DIRECTORY.mkdir(exist_ok=True)
-    logger = logging.getLogger('discord')
-    logger.setLevel(logging.INFO)
+    formatter = logging.Formatter("%(asctime)s:%(levelname)s:%(name)s: %(message)s")
 
-    bot_logger = logging.getLogger('archiver_bot')
+    discord_logger = logging.getLogger("discord")
+    discord_logger.setLevel(logging.INFO)
+
+    bot_logger = logging.getLogger("archiver_bot")
     bot_logger.setLevel(logging.DEBUG)
 
-    handler = logging.FileHandler(filename=LOG_FILENAME, encoding='utf-8', mode='a')
-    formatter = logging.Formatter('%(asctime)s:%(levelname)s:%(name)s: %(message)s')
-    handler.setFormatter(formatter)
+    if not bot_logger.handlers:
+        file_handler = logging.FileHandler(filename=LOG_FILENAME, encoding="utf-8", mode="a")
+        file_handler.setFormatter(formatter)
 
-    logger.addHandler(handler)
-    bot_logger.addHandler(handler)
+        stream_handler = logging.StreamHandler()
+        stream_handler.setFormatter(formatter)
 
-    stream_handler = logging.StreamHandler()
-    stream_handler.setFormatter(formatter)
-    bot_logger.addHandler(stream_handler)
-    logger.addHandler(stream_handler)
+        discord_logger.addHandler(file_handler)
+        discord_logger.addHandler(stream_handler)
+
+        bot_logger.addHandler(file_handler)
+        bot_logger.addHandler(stream_handler)
 
     return bot_logger
 
+
 bot_log = setup_logging()
+
 
 # --- 自定义数据类 ---
 class GuildArchiveSettings:
     """封装单个服务器的归档设置（黑名单模式）"""
+
     def __init__(
         self,
         guild_id: int,
@@ -63,25 +92,28 @@ class GuildArchiveSettings:
         max_active_threads: int,
         last_notice_message_id: int | None = None,
         pinned_thread_moderation: dict | None = None,
+        enable_channel_limit: bool = False,
     ):
-        self.guild_id = guild_id
+        self.guild_id = int(guild_id)
         self.config_name = config_name
         # 黑名单频道：这些频道中的帖子计入活跃总数，但不会被自动归档
-        self.blacklist_channel_ids = blacklist_channel_ids or []
-        self.archive_category_id = archive_category_id
-        self.inactivity_days = inactivity_days
-        self.notification_thread_id = notification_thread_id
-        self.max_active_posts = max_active_posts
-        self.max_active_threads = max_active_threads
+        self.blacklist_channel_ids = [int(cid) for cid in (blacklist_channel_ids or [])]
+        self.archive_category_id = int(archive_category_id) if archive_category_id else None
+        self.inactivity_days = int(inactivity_days)
+        self.notification_thread_id = int(notification_thread_id) if notification_thread_id else None
+        self.max_active_posts = int(max_active_posts)
+        self.max_active_threads = int(max_active_threads)
         self.last_notice_message_id = last_notice_message_id
+        # 显式控制单频道帖子上限是否启用，防止旧配置默认值 100 误归档大型卡区
+        self.enable_channel_limit = bool(enable_channel_limit)
 
         mod_settings = pinned_thread_moderation or {}
-        self.pinned_mod_enabled = mod_settings.get("enabled", False)
+        self.pinned_mod_enabled = bool(mod_settings.get("enabled", False))
         self.allowed_role_ids = [int(role_id) for role_id in mod_settings.get("allowed_role_ids", [])]
         self.allowed_user_ids = [int(user_id) for user_id in mod_settings.get("allowed_user_ids", [])]
 
     def to_dict(self) -> dict:
-        """将设置转换为字典以便保存到JSON"""
+        """将设置转换为字典以便保存到 JSON"""
         return {
             "guild_id": self.guild_id,
             "blacklist_channel_ids": self.blacklist_channel_ids,
@@ -89,6 +121,7 @@ class GuildArchiveSettings:
             "inactivity_days": self.inactivity_days,
             "notification_thread_id": self.notification_thread_id,
             "max_active_posts": self.max_active_posts,
+            "enable_channel_limit": self.enable_channel_limit,
             "max_active_threads": self.max_active_threads,
             "last_notice_message_id": self.last_notice_message_id,
             "pinned_thread_moderation": {
@@ -99,7 +132,7 @@ class GuildArchiveSettings:
         }
 
     @classmethod
-    def from_dict(cls, guild_id: int, config_name: str, data: dict) -> 'GuildArchiveSettings':
+    def from_dict(cls, guild_id: int, config_name: str, data: dict) -> "GuildArchiveSettings":
         """从字典创建 GuildArchiveSettings 实例"""
         return cls(
             guild_id=guild_id,
@@ -108,64 +141,97 @@ class GuildArchiveSettings:
             archive_category_id=data.get("archive_category_id"),
             inactivity_days=data.get("inactivity_days", 0),
             notification_thread_id=data.get("notification_thread_id"),
-            max_active_posts=data.get("max_active_posts", 100),
-            max_active_threads=data.get("max_active_threads", 900),
+            max_active_posts=data.get("max_active_posts", 0),
+            max_active_threads=data.get("max_active_threads", 800),
             last_notice_message_id=data.get("last_notice_message_id"),
             pinned_thread_moderation=data.get("pinned_thread_moderation"),
+            enable_channel_limit=data.get("enable_channel_limit", False),
         )
 
-class ErrorMessage: 
-    """
-    自定义对象: 模拟 discord.Message 对象, 仅包含 created_at 属性
-    """
-    def __init__(self, created_at: datetime): 
-        self.created_at = created_at 
 
-class ThreadMessage: 
-    """
-    自定义对象: 储存帖子对象 thread 和最后一条消息对象 last_message
-    """
-    def __init__(self, thread: discord.Thread, last_message: discord.Message | ErrorMessage):
-        self.thread = thread
-        self.last_message = last_message
+@dataclass
+class ThreadActivityInfo:
+    """记录单个帖子的最后活跃时间及来源状态"""
+
+    thread: discord.Thread
+    last_active_at: datetime  # UTC aware datetime
+    is_fallback_created_at: bool = False  # 若帖子内无现存消息，退化为建帖时间
+    from_cache: bool = False
+
+
+@dataclass
+class ArchivePlanItem:
+    """待归档帖子及其触发原因"""
+
+    info: ThreadActivityInfo
+    reason_tag: str  # "inactivity" | "channel_cap" | "server_cap"
+    reason_label: str
+
+
+# --- 辅助函数 ---
+def ensure_utc(dt: datetime | None) -> datetime:
+    """确保 datetime 为 UTC 时区感知对象"""
+    if dt is None:
+        return datetime.now(timezone.utc)
+    if dt.tzinfo is None:
+        return dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(timezone.utc)
+
+
+def safe_add_embed_field(embed: Embed, name: str, value: str, inline: bool = False):
+    """安全添加 Embed 字段，自动处理长度限制以防 Discord 400 报错"""
+    if not value or not value.strip():
+        return
+    trimmed_name = name[:256]
+    trimmed_value = value if len(value) <= 1024 else value[:1010] + "\n...(已截断)"
+
+    # 检查 Embed 总字符上限 (6000)，预留安全余量
+    current_total = len(embed.title or "") + len(embed.description or "")
+    if embed.author and embed.author.name:
+        current_total += len(embed.author.name)
+    if embed.footer and embed.footer.text:
+        current_total += len(embed.footer.text)
+    for f in embed.fields:
+        current_total += len(f.name) + len(f.value)
+
+    if len(embed.fields) < 25 and (current_total + len(trimmed_name) + len(trimmed_value) <= 5800):
+        embed.add_field(name=trimmed_name, value=trimmed_value, inline=inline)
+
 
 # --- 机器人核心类 ---
 class ThreadArchiverBot(commands.Bot):
     def __init__(self):
         intents = Intents.default()
-        # 默认不启用任何特权 Intent，普通消息事件仍保持启用。
         intents.guilds = True
 
         super().__init__(command_prefix=commands.when_mentioned_or("!archiver "), intents=intents)
 
         self.global_config = {}
         self.guild_settings_map: dict[int, GuildArchiveSettings] = {}
-        self.bot_token = None
+        self.bot_token: str | None = None
         self.operation_lock = asyncio.Lock()
 
         DATA_DIRECTORY.mkdir(exist_ok=True)
-        
+
+        # 置顶帖保活记录
         self.BUMP_RECORDS_FILE = DATA_DIRECTORY / "pinned_thread_bump_records.json"
         self.bump_records: dict[int, dict] = {}
         self.bump_records_lock = asyncio.Lock()
 
+        # 置顶帖最后消息审计记录
         self.PINNED_MESSAGES_FILE = DATA_DIRECTORY / "pinned_thread_last_messages.json"
         self.pinned_last_messages: dict[int, int] = {}
         self.pinned_messages_lock = asyncio.Lock()
 
-        self.succeed_count = 0
-        self.fail_count = 0
-        self.message_succeed_count = 0
-        self.not_found_error_count = 0
-        self.log_get_message_error_details = ""
-        self.log_archived_info_details = ""
-        self.log_archived_error_details = ""
-        self.archive_run_details_for_embed = {}
+        # 活跃帖最后活跃时间缓存: {thread_id: {"last_message_id": int | None, "last_active_ts": float, "is_fallback": bool}}
+        self.ACTIVITY_CACHE_FILE = DATA_DIRECTORY / "thread_activity_cache.json"
+        self.thread_activity_cache: dict[int, dict] = {}
+        self.activity_cache_lock = asyncio.Lock()
 
+    # ---------------- 配置与持久化 ----------------
     async def load_configuration(self):
         """加载配置（从环境变量 GUILD_CONFIGS_JSON）"""
         self.bot_token = os.environ.get("BOT_TOKEN")
-
         if not self.bot_token:
             bot_log.critical("未能从环境变量加载 BOT_TOKEN。请检查 .env 文件。")
             sys.exit(1)
@@ -176,32 +242,30 @@ class ThreadArchiverBot(commands.Bot):
             sys.exit(1)
 
         try:
-            # 约定：GUILD_CONFIGS_JSON 是一个 JSON 对象，键为配置名，值为服务器配置
             guild_configurations = json.loads(raw_json)
             if not isinstance(guild_configurations, dict):
                 raise ValueError("GUILD_CONFIGS_JSON 必须是一个 JSON 对象，其键为服务器配置名。")
 
-            # 为兼容原有结构，仍然保留 self.global_config["guild_configurations"]
             self.global_config = {"guild_configurations": guild_configurations}
+            self.guild_settings_map.clear()
 
             for config_name, settings_data in guild_configurations.items():
                 guild_id = settings_data.get("guild_id")
-
                 if not guild_id:
                     bot_log.warning(f"配置项 '{config_name}' 缺少 'guild_id'，已跳过。")
                     continue
 
+                guild_id = int(guild_id)
                 notice_id_file = DATA_DIRECTORY / f"{config_name}_notice_id.txt"
                 last_notice_id = None
 
                 if notice_id_file.exists():
                     try:
-                        last_notice_id = int(notice_id_file.read_text().strip())
+                        last_notice_id = int(notice_id_file.read_text(encoding="utf-8").strip())
                     except ValueError:
                         bot_log.warning(f"无法解析 {notice_id_file} 中的消息ID。")
 
                 settings_data["last_notice_message_id"] = last_notice_id
-
                 guild_setting = GuildArchiveSettings.from_dict(guild_id, config_name, settings_data)
                 self.guild_settings_map[guild_id] = guild_setting
                 bot_log.info(f"已加载服务器 '{config_name}' (ID: {guild_id}) 的配置。")
@@ -229,34 +293,35 @@ class ThreadArchiverBot(commands.Bot):
         if setting.last_notice_message_id is not None:
             notice_id_file = DATA_DIRECTORY / f"{setting.config_name}_notice_id.txt"
             try:
-                notice_id_file.write_text(str(setting.last_notice_message_id))
+                notice_id_file.write_text(str(setting.last_notice_message_id), encoding="utf-8")
                 bot_log.info(f"已更新 {setting.config_name} 的通知消息ID到 {notice_id_file}")
             except Exception as e:
                 bot_log.error(f"写入 {notice_id_file} 失败: {e}", exc_info=True)
 
     def _save_guild_configs_to_env(self):
-        """将当前内存中的服务器配置写回到 .env 的 GUILD_CONFIGS_JSON 变量"""
-        # 先从 GuildArchiveSettings 对象重建配置字典，确保与运行时状态一致
+        """将当前内存中的服务器配置安全写回到 .env 的 GUILD_CONFIGS_JSON 变量"""
         guild_configurations: dict[str, dict] = {}
         for setting in self.guild_settings_map.values():
             guild_configurations[setting.config_name] = setting.to_dict()
 
         self.global_config = {"guild_configurations": guild_configurations}
-
         new_json_str = json.dumps(guild_configurations, ensure_ascii=False)
+        # 同步更新当前进程环境变量
+        os.environ["GUILD_CONFIGS_JSON"] = new_json_str
+
+        # 若无单引号则使用单引号包裹，避免 python-dotenv 因空格或 # 截断 JSON
+        if "'" not in new_json_str:
+            new_line = f"GUILD_CONFIGS_JSON='{new_json_str}'"
+        else:
+            new_line = f"GUILD_CONFIGS_JSON={new_json_str}"
 
         env_path = Path(".env")
-        existing_content = ""
-        if env_path.exists():
-            existing_content = env_path.read_text(encoding="utf-8")
-
+        existing_content = env_path.read_text(encoding="utf-8") if env_path.exists() else ""
         lines = existing_content.splitlines() if existing_content else []
-        new_line = f"GUILD_CONFIGS_JSON={new_json_str}"
 
         updated = False
         for idx, line in enumerate(lines):
-            stripped = line.strip()
-            if stripped.startswith("GUILD_CONFIGS_JSON="):
+            if line.strip().startswith("GUILD_CONFIGS_JSON="):
                 lines[idx] = new_line
                 updated = True
                 break
@@ -266,39 +331,46 @@ class ThreadArchiverBot(commands.Bot):
                 lines.append("")
             lines.append(new_line)
 
-        if lines:
-            new_content = "\n".join(lines) + "\n"
-        else:
-            new_content = new_line + "\n"
-
+        new_content = ("\n".join(lines) + "\n") if lines else (new_line + "\n")
         env_path.write_text(new_content, encoding="utf-8")
-    
-    
+
     def _load_bump_records(self):
         """同步加载刷新记录文件到内存"""
         try:
-            with open(self.BUMP_RECORDS_FILE, 'r', encoding='utf-8') as f:
+            with open(self.BUMP_RECORDS_FILE, "r", encoding="utf-8") as f:
                 records_from_file = json.load(f)
-                # 将ISO格式的时间字符串转换回datetime对象
                 for thread_id, data in records_from_file.items():
                     self.bump_records[int(thread_id)] = {
-                        "last_bumped_utc": datetime.fromisoformat(data["last_bumped_utc"])
+                        "last_bumped_utc": ensure_utc(datetime.fromisoformat(data["last_bumped_utc"]))
                     }
                 bot_log.info(f"成功从 {self.BUMP_RECORDS_FILE} 加载了 {len(self.bump_records)} 条置顶帖刷新记录。")
         except FileNotFoundError:
             bot_log.info(f"刷新记录文件 {self.BUMP_RECORDS_FILE} 未找到，将创建一个新的。")
-        except (json.JSONDecodeError, KeyError, TypeError) as e:
+        except (json.JSONDecodeError, KeyError, TypeError, ValueError) as e:
             bot_log.error(f"加载刷新记录文件失败，文件可能已损坏: {e}", exc_info=True)
+
+    async def _save_bump_records(self):
+        """将内存中的刷新记录保存到文件"""
+        async with self.bump_records_lock:
+            try:
+                records_to_save = {
+                    str(tid): {"last_bumped_utc": data["last_bumped_utc"].isoformat()}
+                    for tid, data in self.bump_records.items()
+                }
+                with open(self.BUMP_RECORDS_FILE, "w", encoding="utf-8") as f:
+                    json.dump(records_to_save, f, indent=4)
+            except Exception as e:
+                bot_log.error(f"保存刷新记录到 {self.BUMP_RECORDS_FILE} 失败: {e}", exc_info=True)
 
     def _load_pinned_last_messages(self):
         """同步加载置顶帖最后消息ID记录"""
         try:
-            with open(self.PINNED_MESSAGES_FILE, 'r', encoding='utf-8') as f:
+            with open(self.PINNED_MESSAGES_FILE, "r", encoding="utf-8") as f:
                 data = json.load(f)
-                self.pinned_last_messages = {int(k): int(v) for k, v in data.items()}
+                self.pinned_last_messages = {int(k): int(v) for k, v in data.items() if v is not None}
                 bot_log.info(f"成功加载了 {len(self.pinned_last_messages)} 条置顶帖消息记录。")
         except FileNotFoundError:
-            bot_log.info(f"置顶帖消息记录文件未找到，将创建新的。")
+            bot_log.info("置顶帖消息记录文件未找到，将创建新的。")
         except Exception as e:
             bot_log.error(f"加载置顶帖消息记录失败: {e}", exc_info=True)
 
@@ -307,35 +379,53 @@ class ThreadArchiverBot(commands.Bot):
         async with self.pinned_messages_lock:
             try:
                 data = {str(k): v for k, v in self.pinned_last_messages.items()}
-                with open(self.PINNED_MESSAGES_FILE, 'w', encoding='utf-8') as f:
+                with open(self.PINNED_MESSAGES_FILE, "w", encoding="utf-8") as f:
                     json.dump(data, f, indent=4)
             except Exception as e:
                 bot_log.error(f"保存置顶帖消息记录失败: {e}", exc_info=True)
 
-    async def _save_bump_records(self):
-        """将内存中的刷新记录保存到文件"""
-        async with self.bump_records_lock:
+    def _load_thread_activity_cache(self):
+        """加载活跃帖最后活跃时间缓存"""
+        try:
+            with open(self.ACTIVITY_CACHE_FILE, "r", encoding="utf-8") as f:
+                raw = json.load(f)
+                for tid_str, entry in raw.items():
+                    if isinstance(entry, dict) and "last_active_ts" in entry:
+                        self.thread_activity_cache[int(tid_str)] = {
+                            "last_message_id": entry.get("last_message_id"),
+                            "last_active_ts": float(entry["last_active_ts"]),
+                            "is_fallback": bool(entry.get("is_fallback", False)),
+                        }
+                bot_log.info(f"成功加载了 {len(self.thread_activity_cache)} 条帖子活跃时间缓存。")
+        except FileNotFoundError:
+            bot_log.info("帖子活跃时间缓存文件未找到，将在首次运行后自动生成。")
+        except Exception as e:
+            bot_log.warning(f"加载帖子活跃时间缓存失败，将重新构建: {e}")
+
+    async def _save_thread_activity_cache(self, keep_thread_ids: set[int] | None = None):
+        """保存并按需清理过期的帖子活跃时间缓存"""
+        async with self.activity_cache_lock:
             try:
-                # 准备要写入的数据，将datetime对象转换为ISO格式的字符串
-                records_to_save = {}
-                for thread_id, data in self.bump_records.items():
-                    records_to_save[str(thread_id)] = {
-                        "last_bumped_utc": data["last_bumped_utc"].isoformat()
+                if keep_thread_ids is not None:
+                    # 仅保留当前仍在受管服务器活跃池中的帖子，防止缓存无限膨胀
+                    self.thread_activity_cache = {
+                        tid: val for tid, val in self.thread_activity_cache.items() if tid in keep_thread_ids
                     }
-                
-                with open(self.BUMP_RECORDS_FILE, 'w', encoding='utf-8') as f:
-                    json.dump(records_to_save, f, indent=4)
+                serializable = {str(tid): val for tid, val in self.thread_activity_cache.items()}
+                with open(self.ACTIVITY_CACHE_FILE, "w", encoding="utf-8") as f:
+                    json.dump(serializable, f)
             except Exception as e:
-                bot_log.error(f"保存刷新记录到 {self.BUMP_RECORDS_FILE} 失败: {e}", exc_info=True)
-    
-    
+                bot_log.warning(f"保存帖子活跃时间缓存失败: {e}")
+
+    # ---------------- 生命周期与事件 ----------------
     async def setup_hook(self):
         """Bot启动时的异步设置"""
         self._load_bump_records()
         self._load_pinned_last_messages()
+        self._load_thread_activity_cache()
         await self.load_configuration()
         await self.add_cog(ArchiveManagerCog(self))
-    
+
         try:
             synced = await self.tree.sync()
             bot_log.info(f"已同步 {len(synced)} 个应用命令。")
@@ -344,670 +434,818 @@ class ThreadArchiverBot(commands.Bot):
 
         self.periodic_thread_audit.start()
 
-    def _is_user_exempt(self, author: discord.Member | discord.User, thread: discord.Thread, settings: GuildArchiveSettings) -> bool:
-        """
-        检查用户是否在置顶帖中拥有消息豁免权。
-        返回 True 表示用户豁免，不应删除其消息。
-        """
-
-        # 帖主 豁免
+    def _is_user_exempt(
+        self, author: discord.Member | discord.User, thread: discord.Thread, settings: GuildArchiveSettings
+    ) -> bool:
+        """检查用户是否在置顶帖中拥有消息豁免权"""
         if thread.owner_id and author.id == thread.owner_id:
             return True
 
-        # 只有 discord.Member 对象才有权限和角色信息，需要进行类型检查
         if isinstance(author, discord.Member):
-            # 服务器管理员 (Administrator) 豁免
             if author.guild_permissions.administrator:
                 return True
-            
-            # 在配置中的豁免角色组ID (allowed_role_ids)
             author_role_ids = {role.id for role in author.roles}
             if not author_role_ids.isdisjoint(settings.allowed_role_ids):
                 return True
 
-        # 在配置中的豁免用户ID (allowed_user_ids)
         if author.id in settings.allowed_user_ids:
             return True
-        
-        # 如果以上规则都不满足，则用户不豁免
+
         return False
 
     async def on_ready(self):
         if not self.user:
             bot_log.error("机器人未能正确初始化 self.user。")
             return
-            
-        bot_log.info(f"机器人 '{self.user.name}' (ID: {self.user.id}) 已成功登录并准备就绪！")
-        bot_log.info(f"当前管理 {len(self.guild_settings_map)} 个服务器配置。")
+
+        bot_log.info(
+            f"机器人 '{self.user.name}' (ID: {self.user.id}) 已成功登录！"
+            f"当前管理 {len(self.guild_settings_map)} 个服务器配置，巡检间隔: {AUDIT_INTERVAL_MINUTES} 分钟。"
+        )
 
         main_admin_channel_id_str = os.environ.get("MAIN_ADMIN_CHANNEL_ID")
-
         if main_admin_channel_id_str and main_admin_channel_id_str.isdigit():
             main_admin_channel_id = int(main_admin_channel_id_str)
             try:
                 channel = await self.fetch_channel(main_admin_channel_id)
-
                 if isinstance(channel, (TextChannel, Thread)):
-                    await channel.send(f"✅ **{self.user.name} 已启动** ({datetime.now().strftime('%Y-%m-%d %H:%M:%S')})")
-
+                    await channel.send(
+                        f"✅ **{self.user.name} 已启动** "
+                        f"({datetime.now().strftime('%Y-%m-%d %H:%M:%S')} | 巡检间隔: {AUDIT_INTERVAL_MINUTES}min)"
+                    )
             except discord.NotFound:
-                bot_log.warning(f"配置的 main_admin_channel_id: {main_admin_channel_id} 未找到。")
-
+                bot_log.warning(f"配置的 MAIN_ADMIN_CHANNEL_ID: {main_admin_channel_id} 未找到。")
             except discord.Forbidden:
-                bot_log.warning(f"无权向 main_admin_channel_id: {main_admin_channel_id} 发送消息。")
-
+                bot_log.warning(f"无权向 MAIN_ADMIN_CHANNEL_ID: {main_admin_channel_id} 发送消息。")
             except Exception as e:
                 bot_log.error(f"发送启动通知时出错: {e}", exc_info=True)
 
     async def on_message(self, message: discord.Message):
-        # 忽略机器人自身的消息和私信
         if message.author.bot or not message.guild:
             return
 
-        # 检查消息是否在帖子(Thread)中
         if not isinstance(message.channel, discord.Thread):
             return
 
         thread = message.channel
-        
-        # 检查帖子是否被置顶
         if not thread.flags.pinned:
             return
 
-        # 获取当前服务器的配置
         settings = self.guild_settings_map.get(message.guild.id)
         if not settings or not settings.pinned_mod_enabled:
-            return # 如果没有配置或功能未启用，则不做任何事
-
-        # 检查用户是否在豁免名单中
-        author = message.author
-        
-        if self._is_user_exempt(author, thread, settings):
             return
-        
-        # 如果用户不在豁免名单，则删除消息
+
+        if self._is_user_exempt(message.author, thread, settings):
+            return
+
         try:
             await message.delete()
-            bot_log.debug(f"已删除用户 {author.name} ({author.id}) 在置顶帖 '{thread.name}' 中的消息。")
+            bot_log.debug(f"已删除用户 {message.author.name} ({message.author.id}) 在置顶帖 '{thread.name}' 中的消息。")
         except discord.Forbidden:
             parent_name = thread.parent.name if thread.parent else "未知频道"
             bot_log.warning(f"无法删除消息：缺少在频道 '{parent_name}' 中 '管理消息' 的权限。")
         except discord.NotFound:
-            # 消息可能已经被用户自己删除了
             pass
         except Exception as e:
-            bot_log.error(f"删除消息时发生未知错误: {e}", exc_info=True)
+            bot_log.error(f"删除置顶帖非豁免消息时发生错误: {e}", exc_info=True)
 
-    @tasks.loop(minutes=15)
+    # ---------------- 定时任务 ----------------
+    @tasks.loop(minutes=AUDIT_INTERVAL_MINUTES)
     async def periodic_thread_audit(self):
-        """定时检查并处理不活跃的帖子"""
+        """定时检查并处理各服务器活跃帖子"""
         if not self.guild_settings_map:
             return
 
         async with self.operation_lock:
             bot_log.info("开始执行周期性帖子审计...")
-            for guild_id, settings in self.guild_settings_map.items():
-                guild = self.get_guild(guild_id)
+            all_known_active_ids: set[int] = set()
 
+            for guild_id, settings in list(self.guild_settings_map.items()):
+                guild = self.get_guild(guild_id)
                 if not guild:
                     bot_log.warning(f"审计：找不到服务器 {guild_id}，跳过。")
                     continue
 
-                bot_log.info(f"正在审计服务器: '{guild.name}' (ID: {guild_id})")
-                await self.process_guild_threads(guild, settings, manual=False)
-                await asyncio.sleep(10) 
+                try:
+                    bot_log.info(f"正在审计服务器: '{guild.name}' (ID: {guild_id})")
+                    remaining_ids = await self.process_guild_threads(guild, settings, manual=False)
+                    if remaining_ids is not None:
+                        all_known_active_ids.update(remaining_ids)
+                except Exception as e:
+                    bot_log.error(f"审计服务器 '{guild.name}' (ID: {guild_id}) 时发生未捕获异常: {e}", exc_info=True)
+
+                await asyncio.sleep(3)
+
+            # 持久化并顺便清理已不再活跃的旧缓存条目
+            if all_known_active_ids:
+                await self._save_thread_activity_cache(keep_thread_ids=all_known_active_ids)
             bot_log.info("周期性帖子审计完成。")
 
     @periodic_thread_audit.before_loop
     async def before_periodic_audit(self):
         await self.wait_until_ready()
-        bot_log.info("定时审计任务已准备就绪。")
+        bot_log.info(f"定时审计任务已准备就绪（每 {AUDIT_INTERVAL_MINUTES} 分钟执行一次）。")
 
-    async def process_guild_threads(self, guild: Guild, settings: GuildArchiveSettings, manual: bool = False):
+    @periodic_thread_audit.error
+    async def on_periodic_audit_error(self, error: BaseException):
+        bot_log.error(f"定时审计循环捕获顶层异常（循环将继续保持运行）: {error}", exc_info=True)
 
-        now_utc_timestamp = time.time()
-        current_run_timestamp_str = datetime.fromtimestamp(now_utc_timestamp, tz=timezone(timedelta(hours=8))).strftime('%Y-%m-%d %H:%M:%S UTC+8')
-        hash_input = str(now_utc_timestamp)
-        run_hash_value = hashlib.md5(hash_input.encode()).hexdigest()[:8]
-
-        self.succeed_count = 0
-        self.fail_count = 0
-        self.message_succeed_count = 0
-        self.not_found_error_count = 0
-        self.log_get_message_error_details = ""
-        self.log_archived_info_details = ""
-        self.log_archived_error_details = ""
-        self.archive_run_details_for_embed = {}
-
-        initial_log_info = ""
-        overall_summary_embed_description = ""
+    # ---------------- 核心归档流水线 ----------------
+    async def process_guild_threads(
+        self, guild: Guild, settings: GuildArchiveSettings, manual: bool = False
+    ) -> set[int] | None:
+        """
+        单次全流程处理：
+        1. 拉取全服活跃帖 -> 2. 置顶帖保活与审计 -> 3. 候选帖权限与黑名单过滤 ->
+        4. 缓存优先获取最后活跃时间 -> 5. 统一规划归档（超时 -> 单频道上限 -> 全服上限） ->
+        6. 并发归档 -> 7. 生成多维统计日志与监控面板报告
+        """
         global_start_time = time.time()
-        overall_summary_embed_description += f"> 不活跃 **{settings.inactivity_days}** 天归档：**{'开启' if settings.inactivity_days > 0 else '关闭'}**\n"
-        initial_log_info += f"> 不活跃 **{settings.inactivity_days}** 天归档: {'开启' if settings.inactivity_days > 0 else '关闭'}\n"
+        now_utc = datetime.now(timezone.utc)
+        current_run_timestamp_str = now_utc.astimezone(timezone(timedelta(hours=8))).strftime(
+            "%Y-%m-%d %H:%M:%S UTC+8"
+        )
+        run_hash_value = hashlib.md5(f"{guild.id}-{global_start_time}".encode()).hexdigest()[:8]
 
-        blacklist_count = len(settings.blacklist_channel_ids)
-        if blacklist_count > 0:
-            overall_summary_embed_description += f"> 黑名单频道数: **{blacklist_count}**（这些频道中的帖子不会被自动归档）\n"
-            initial_log_info += f"已配置 {blacklist_count} 个黑名单频道，这些频道中的帖子不会被自动归档。\n"
-        else:
-            overall_summary_embed_description += f"> 未配置黑名单频道，默认对所有频道执行归档策略\n"
-            initial_log_info += "未配置黑名单频道，将对所有频道执行归档策略。\n"
-
-        overall_summary_embed_description += "\n"
-
-        if manual:
-            initial_log_info += f"\n<== 手动开始清理 (服务器级优先) ==> 服务器: {settings.config_name} ({guild.name}) | 日志索引: {run_hash_value}"
-
-        else:
-            initial_log_info += f"\n<== 自动开始清理 (服务器级优先) ==> 服务器: {settings.config_name} ({guild.name}) | 日志索引: {run_hash_value}"
-
-        initial_log_info += f"\n服务器级活跃帖目标: {settings.max_active_threads}"
-        overall_summary_embed_description += f"> 服务器活跃帖目标: **{settings.max_active_threads}**\n"
+        mode_str = "手动清理" if manual else "自动清理"
+        log_lines = [
+            f"> 不活跃 **{settings.inactivity_days}** 天归档: {'开启' if settings.inactivity_days > 0 else '关闭'}",
+            (
+                f"已配置 {len(settings.blacklist_channel_ids)} 个黑名单频道，这些频道中的帖子不会被自动归档。"
+                if settings.blacklist_channel_ids
+                else "未配置黑名单频道，将对所有有权限频道执行归档策略。"
+            ),
+            f"\n<== 开始{mode_str} ==> 服务器: {settings.config_name} ({guild.name}) | 日志索引: {run_hash_value}",
+            f"服务器级活跃帖目标: {settings.max_active_threads}",
+        ]
 
         # --- 步骤 1: 获取服务器所有活跃帖子 ---
-        all_server_active_threads_list = []
         try:
             all_server_active_threads_list = await guild.active_threads()
         except discord.Forbidden:
             bot_log.error(f"无权获取服务器 {guild.name} 的活跃帖子。", exc_info=True)
-
+            return None
         except Exception as e:
-            bot_log.error(f"获取或筛选服务器 {guild.name} 活跃帖子失败: {e}", exc_info=True)
-            initial_log_info += f"\n错误：获取或筛选服务器活跃帖子失败: {e}"
-            return
+            bot_log.error(f"获取服务器 {guild.name} 活跃帖子失败: {e}", exc_info=True)
+            return None
 
         current_total_server_threads = len(all_server_active_threads_list)
-        overall_summary_embed_description += f"> 当前服务器总活跃帖: **{current_total_server_threads}**\n"
 
-        # --- 步骤 2: 置顶帖处理 (全服务器范围) ---
-        pinned_threads_set_server_wide = set()
-        initial_log_info += f"\n置顶帖处理 (全服务器):"
-        now_utc = datetime.now(timezone.utc)
-        # 48 小时前的刷新操作已经可能失效
+        # --- 步骤 2: 置顶帖保活处理与审计 ---
+        pinned_threads_set_server_wide: set[int] = set()
+        log_lines.append("置顶帖处理 (全服务器):")
         self_trust_duration = timedelta(hours=48)
+        bump_changed = False
+        pinned_msg_changed = False
 
         for thread_obj in all_server_active_threads_list:
             if not thread_obj.flags.pinned:
-                continue # 只处理置顶帖
+                continue
 
             pinned_threads_set_server_wide.add(thread_obj.id)
-            
             try:
-                # 如果帖子意外被归档，立即激活
                 if thread_obj.archived:
                     await thread_obj.edit(archived=False, reason="[保活] 发现已归档的置顶帖，进行激活")
-                    initial_log_info += f"\n  [已取消置顶帖归档] {thread_obj.name} (ID: {thread_obj.id})"
+                    log_lines.append(f"  [已取消置顶帖归档] {thread_obj.name} (ID: {thread_obj.id})")
                     continue
 
-                # 检查内存中的持久化记录
                 record = self.bump_records.get(thread_obj.id)
                 if record and (now_utc - record["last_bumped_utc"] < self_trust_duration):
-                    # 如果我们在48小时内刷新过它，就跳过它，不进行刷新
                     continue
 
-                # 执行保活操作
                 reason_for_bump = "记录不存在" if not record else "记录已过期"
-                initial_log_info += f"\n  [需要保活] {thread_obj.name} (原因: {reason_for_bump})。"
-                
-                action_taken = False
+                log_lines.append(f"  [需要保活] {thread_obj.name} (原因: {reason_for_bump})")
+
+                prev_stored_msg_id = self.pinned_last_messages.get(thread_obj.id)
+                prev_thread_msg_id = thread_obj.last_message_id
+
                 if not thread_obj.locked:
-                    temp_message = await thread_obj.send(f"置顶帖保活，稍后删除")
+                    temp_message = await thread_obj.send("置顶帖保活，稍后删除")
                     await temp_message.delete()
-                    action_taken = True
-                    initial_log_info += f" -> 已通过消息刷新。"
+                    log_lines.append("    -> 已通过消息刷新。")
+                    # 若保活前没有未审计的新消息，同步更新审计指针，避免保活消息本身触发无意义的 50 条历史拉取
+                    if prev_stored_msg_id is not None and prev_stored_msg_id == prev_thread_msg_id:
+                        self.pinned_last_messages[thread_obj.id] = temp_message.id
+                        pinned_msg_changed = True
                 else:
                     await thread_obj.edit(locked=True, reason="[保活] 刷新锁定的置顶帖活跃度")
-                    action_taken = True
-                    initial_log_info += f" -> 已通过Edit刷新。"
-                
-                # 更新内存记录并异步保存到文件
-                if action_taken:
-                    self.bump_records[thread_obj.id] = { "last_bumped_utc": now_utc }
-                    await self._save_bump_records()
-                    initial_log_info += f" 等待4秒..."
-                    await asyncio.sleep(4) # 为防止API速率限制，在每次成功刷新后等待
+                    log_lines.append("    -> 已通过 Edit 刷新。")
 
+                self.bump_records[thread_obj.id] = {"last_bumped_utc": now_utc}
+                bump_changed = True
+                await asyncio.sleep(2)
             except Exception as e:
-                initial_log_info += f"\n  [保活失败] 处理 {thread_obj.name} 时发生未知错误: {e}"
+                log_lines.append(f"  [保活失败] 处理 {thread_obj.name} 时发生错误: {e}")
+
+        if bump_changed:
+            await self._save_bump_records()
+        if pinned_msg_changed:
+            await self._save_pinned_last_messages()
 
         pinned_server_wide_count = len(pinned_threads_set_server_wide)
-        initial_log_info += f"\n全服务器置顶帖子数: **{pinned_server_wide_count}**"
-        overall_summary_embed_description += f"> 全服置顶帖: {pinned_server_wide_count}\n"
-        
-        # --- 置顶帖消息审计 ---
+        log_lines.append(f"全服务器置顶帖子数: **{pinned_server_wide_count}**")
+
+        audit_embed_items: list[tuple[str, str]] = []
         if settings.pinned_mod_enabled and pinned_server_wide_count > 0:
-            audit_log = await self._audit_pinned_thread_messages(guild, settings, pinned_threads_set_server_wide)
-            initial_log_info += audit_log
-        
-        # --- 步骤 3: 服务器级数量控制 ---
-        kill_count_server_level = current_total_server_threads - settings.max_active_threads
-        initial_log_info += f"\n计算服务器级归档数: (总活跃 {current_total_server_threads}) - (目标 {settings.max_active_threads}) = {kill_count_server_level}"
+            audit_log, audit_embed_items = await self._audit_pinned_thread_messages(
+                guild, settings, all_server_active_threads_list, pinned_threads_set_server_wide
+            )
+            log_lines.append(audit_log)
 
-        threads_archived_this_run = 0
+        # --- 步骤 3: 候选帖子分类与前置权限过滤 ---
+        blacklisted_parent_ids = set(settings.blacklist_channel_ids)
+        me = guild.me
 
-        if kill_count_server_level > 0:
-            overall_summary_embed_description += f"> 服务器需归档数量: **{kill_count_server_level}**\n"
-            initial_log_info += f"\n服务器级需归档数量: {kill_count_server_level}。开始筛选候选帖子..."
+        candidate_threads: list[discord.Thread] = []
+        locked_count = 0
+        blacklisted_thread_count = 0
+        no_perm_threads: list[discord.Thread] = []
+        no_perm_parent_ids: set[int] = set()
 
-            candidate_threads_for_server_kill = []
+        for t_obj in all_server_active_threads_list:
+            if t_obj.id in pinned_threads_set_server_wide:
+                continue
+            if t_obj.locked:
+                locked_count += 1
+                continue
+            if t_obj.parent_id in blacklisted_parent_ids:
+                blacklisted_thread_count += 1
+                continue
 
-            # 黑名单频道内的帖子计入活跃总数，但不会作为归档候选
-            blacklisted_parent_ids_set = set(settings.blacklist_channel_ids)
+            # 前置检查管理帖子与读取历史权限，避免无权限频道每轮固定抢占名额并报错
+            if me is not None:
+                perms = t_obj.permissions_for(me)
+                if not (perms.manage_threads and perms.view_channel and perms.read_message_history):
+                    no_perm_threads.append(t_obj)
+                    if t_obj.parent_id:
+                        no_perm_parent_ids.add(t_obj.parent_id)
+                    continue
 
-            for thread_obj in all_server_active_threads_list:
-                if (
-                    thread_obj.id not in pinned_threads_set_server_wide
-                    and not thread_obj.locked
-                    and thread_obj.parent_id not in blacklisted_parent_ids_set
-                ):
-                    candidate_threads_for_server_kill.append(thread_obj)
+            candidate_threads.append(t_obj)
 
-            initial_log_info += f"\n  可用于服务器级归档的候选帖子数(排除置顶/锁定/黑名单频道): {len(candidate_threads_for_server_kill)}"
+        log_lines.append(
+            f"候选池统计: 总活跃={current_total_server_threads} | 置顶={pinned_server_wide_count} | "
+            f"锁定={locked_count} | 黑名单保护={blacklisted_thread_count} | "
+            f"无权限跳过={len(no_perm_threads)} | 可归档候选={len(candidate_threads)}"
+        )
 
-            if candidate_threads_for_server_kill:
-                get_msg_start = time.time()
-                thread_message_obj_list_server_level = await self._get_last_message_task(candidate_threads_for_server_kill)
-                get_msg_time = time.time() - get_msg_start
-                initial_log_info += f"\n  获取候选帖子 最后一条消息 耗时: {get_msg_time:.3f}s (S:{self.message_succeed_count}/F:{self.not_found_error_count})"
+        # --- 步骤 4: 单次获取所有候选帖最后活跃时间（内存缓存优先） ---
+        get_msg_start = time.time()
+        activity_infos, fetch_stats, get_msg_error_lines = await self._resolve_threads_last_activity(candidate_threads)
+        get_msg_elapsed = time.time() - get_msg_start
 
-                thread_message_obj_list_server_level.sort(key=lambda tm_obj: tm_obj.last_message.created_at)
+        if manual:
+            # 手动触发时也即时落盘缓存
+            await self._save_thread_activity_cache()
 
-                threads_to_actually_archive_server_level = thread_message_obj_list_server_level[:kill_count_server_level]
-                initial_log_info += f"\n  将实际归档 (服务器级): {len(threads_to_actually_archive_server_level)} 个帖子"
+        log_lines.append(
+            f"获取候选帖活跃时间耗时: {get_msg_elapsed:.3f}s "
+            f"(缓存命中:{fetch_stats['cache_hit']} | API拉取成功:{fetch_stats['api_ok']} | "
+            f"空帖兜底:{fetch_stats['empty_fallback']} | 异常跳过:{fetch_stats['skipped_error']})"
+        )
 
-                # 执行归档 (服务器级)
-                archive_task_start_time_sl = time.time()
+        # 按最后活跃时间从最老到最新排序
+        activity_infos.sort(key=lambda item: item.last_active_at)
 
-                if threads_to_actually_archive_server_level:
-                    initial_succeed_count = self.succeed_count
-                    initial_fail_count = self.fail_count
-                    await self._archive_thread_task(threads_to_actually_archive_server_level, settings)
-                    threads_archived_this_run = self.succeed_count - initial_succeed_count
-                archive_task_time_sl = time.time() - archive_task_start_time_sl
-                initial_log_info += f"\n  服务器级归档操作耗时: {archive_task_time_sl:.3f}s (成功:{self.succeed_count - initial_succeed_count}, 失败:{self.fail_count - initial_fail_count})"
-        else:
-            initial_log_info += f"\n服务器活跃帖数在目标 ({settings.max_active_threads}) 之内，无需归档操作。"
-            overall_summary_embed_description += f"> 服务器活跃帖数在目标内，无需归档操作。\n"
+        # --- 步骤 5: 统一规划待归档列表（严格去重） ---
+        planned_map: dict[int, ArchivePlanItem] = {}
 
-        bot_log.info(initial_log_info)
-
-        # --- 步骤 4: 基于频道的不活跃天数归档---
+        # 5.1 阶段一：按不活跃天数筛选
+        inactivity_planned_count = 0
         if settings.inactivity_days > 0:
-            log_inactivity_phase = "\n开始检查各非黑名单频道中的不活跃帖子..."
+            inactivity_cutoff = now_utc - timedelta(days=settings.inactivity_days)
+            for info in activity_infos:
+                if info.last_active_at < inactivity_cutoff:
+                    planned_map[info.thread.id] = ArchivePlanItem(
+                        info=info,
+                        reason_tag="inactivity",
+                        reason_label=f">{settings.inactivity_days}天未活跃",
+                    )
+                    inactivity_planned_count += 1
 
-            blacklisted_forum_channel_ids_set = set(settings.blacklist_channel_ids)
-
-            # 从之前获取的全服务器活跃帖子中筛选出仍在非黑名单频道内且仍然活跃（未被服务器级归档）的帖子
-            active_threads_for_inactivity_check = []
+        # 5.2 阶段二：单频道活跃上限筛选（仅在显式开启 enable_channel_limit 且 max_active_posts > 0 时生效）
+        channel_cap_planned_count = 0
+        if settings.enable_channel_limit and settings.max_active_posts > 0:
+            # 统计扣除阶段一归档帖后，各非黑名单父频道剩余的活跃帖（含该频道内置顶/锁定帖）
+            channel_active_counts: Counter[int] = Counter()
             for t_obj in all_server_active_threads_list:
-                if (
-                    t_obj.parent_id not in blacklisted_forum_channel_ids_set
-                    and t_obj.id not in pinned_threads_set_server_wide
-                    and not t_obj.archived
-                    and not t_obj.locked
-                ):
-                    active_threads_for_inactivity_check.append(t_obj)
+                if t_obj.parent_id and t_obj.parent_id not in blacklisted_parent_ids:
+                    if t_obj.id not in planned_map:
+                        channel_active_counts[t_obj.parent_id] += 1
 
-            if active_threads_for_inactivity_check:
-                log_inactivity_phase += f"\n  找到 {len(active_threads_for_inactivity_check)} 个在非黑名单频道中的活跃、非置顶帖进行不活跃检查"
+            # 从老到新遍历尚未归档的候选帖，若所在父频道超限则加入归档计划
+            for info in activity_infos:
+                tid = info.thread.id
+                pid = info.thread.parent_id
+                if tid in planned_map or not pid:
+                    continue
+                if channel_active_counts[pid] > settings.max_active_posts:
+                    planned_map[tid] = ArchivePlanItem(
+                        info=info,
+                        reason_tag="channel_cap",
+                        reason_label=f"单频道超限(>{settings.max_active_posts})",
+                    )
+                    channel_active_counts[pid] -= 1
+                    channel_cap_planned_count += 1
 
-                get_msg_start_ia = time.time()
-                current_msg_succeed = self.message_succeed_count
-                current_msg_fail = self.not_found_error_count
-                thread_message_obj_list_inactivity = await self._get_last_message_task(active_threads_for_inactivity_check)
-                get_msg_time_ia = time.time() - get_msg_start_ia
-                log_inactivity_phase += f"\n  获取不活跃检查帖子的最后一条消息耗时: {get_msg_time_ia:.3f}s (S:{self.message_succeed_count-current_msg_succeed}/F:{self.not_found_error_count-current_msg_fail})"
+        # 5.3 阶段三：全服活跃总数上限控制（挤压归档）
+        server_cap_planned_count = 0
+        if settings.max_active_threads > 0:
+            projected_remaining_total = current_total_server_threads - len(planned_map)
+            kill_needed_server_level = projected_remaining_total - settings.max_active_threads
+            if kill_needed_server_level > 0:
+                for info in activity_infos:
+                    if kill_needed_server_level <= 0:
+                        break
+                    if info.thread.id in planned_map:
+                        continue
+                    planned_map[info.thread.id] = ArchivePlanItem(
+                        info=info,
+                        reason_tag="server_cap",
+                        reason_label=f"全服超限挤压(>{settings.max_active_threads})",
+                    )
+                    kill_needed_server_level -= 1
+                    server_cap_planned_count += 1
 
-                threads_to_archive_due_to_inactivity = []
-                now_utc_naive = datetime.now(timezone.utc).replace(tzinfo=None)
-                inactivity_threshold_date = now_utc_naive - timedelta(days=settings.inactivity_days)
+        planned_items = list(planned_map.values())
+        # 保持按最后活跃时间从老到新排序执行
+        planned_items.sort(key=lambda x: x.info.last_active_at)
 
-                for tm_obj in thread_message_obj_list_inactivity:
-                    last_activity_naive = tm_obj.last_message.created_at.replace(tzinfo=None)
+        log_lines.append(
+            f"归档计划汇总: 共需归档 {len(planned_items)} 个 "
+            f"(超时归档={inactivity_planned_count}, 频道超限={channel_cap_planned_count}, 全服挤压={server_cap_planned_count})"
+        )
 
-                    if last_activity_naive < inactivity_threshold_date:
-                        threads_to_archive_due_to_inactivity.append(tm_obj)
+        # --- 步骤 6: 执行归档 ---
+        archive_start_time = time.time()
+        archived_ok_items, archived_fail_items = await self._archive_thread_batch(planned_items, now_utc)
+        archive_elapsed = time.time() - archive_start_time
 
-                log_inactivity_phase += f"\n  找到 {len(threads_to_archive_due_to_inactivity)} 个帖子因不活跃需要归档"
+        succeed_count = len(archived_ok_items)
+        fail_count = len(archived_fail_items)
+        archived_ok_ids = {item.info.thread.id for item, _ in archived_ok_items}
 
-                if threads_to_archive_due_to_inactivity:
-                    archive_task_start_time_ia = time.time()
-                    initial_succeed_count_ia = self.succeed_count
-                    initial_fail_count_ia = self.fail_count
-                    await self._archive_thread_task(threads_to_archive_due_to_inactivity, settings)
-                    threads_archived_this_run += (self.succeed_count - initial_succeed_count_ia)
-                    archive_task_time_ia = time.time() - archive_task_start_time_ia
-                    log_inactivity_phase += f"\n  不活跃帖子归档操作耗时: {archive_task_time_ia:.3f}s (成功:{self.succeed_count - initial_succeed_count_ia}, 失败:{self.fail_count - initial_fail_count_ia})"
-            else:
-                log_inactivity_phase += "\n  没有在监控频道中找到需要进行不活跃检查的帖子。"
+        # 按原因统计实际成功归档数
+        ok_by_reason = Counter(item.reason_tag for item, _ in archived_ok_items)
 
-            bot_log.info(log_inactivity_phase)
+        if planned_items:
+            log_lines.append(f"归档操作耗时: {archive_elapsed:.3f}s (成功:{succeed_count}, 失败:{fail_count})")
+        else:
+            log_lines.append("当前无需归档任何帖子。")
 
-        # --- 步骤 5: 日志与面板信息整理---
-        global_finish_time = time.time()
-        log_result_summary = f"\n--- 运行总结 (索引: {run_hash_value}) ---"
-        log_result_summary += f"\n总计成功归档帖子: {self.succeed_count}"
-        log_result_summary += f"\n总计归档失败: {self.fail_count}"
-        log_result_summary += f"\n总计获取消息成功: {self.message_succeed_count}"
-        log_result_summary += f"\n总计获取消息失败: {self.not_found_error_count}"
-        log_result_summary += f"\n总运行耗时: {global_finish_time - global_start_time:.3f}秒"
+        # 写入详细文件日志
+        total_elapsed = time.time() - global_start_time
+        bot_log.info("\n".join(log_lines))
 
-        if self.log_archived_info_details:
-            bot_log.info(f"\n--- 归档成功详情 (索引: {run_hash_value}) ---{self.log_archived_info_details}")
-        if self.log_get_message_error_details:
-            bot_log.warning(f"\n--- 获取消息失败详情 (索引: {run_hash_value}) ---{self.log_get_message_error_details}")
-        if self.log_archived_error_details:
-            bot_log.error(f"\n--- 归档失败详情 (索引: {run_hash_value}) ---{self.log_archived_error_details}")
-        bot_log.info(log_result_summary)
+        if archived_ok_items:
+            detail_log = "\n".join(log_line for _, log_line in archived_ok_items)
+            bot_log.info(f"\n--- 归档成功详情 (索引: {run_hash_value}) ---\n{detail_log}")
+        if get_msg_error_lines:
+            bot_log.warning(f"\n--- 获取消息异常详情 (索引: {run_hash_value}) ---\n" + "\n".join(get_msg_error_lines))
+        if archived_fail_items:
+            fail_log = "\n".join(err_line for _, err_line, _ in archived_fail_items)
+            bot_log.error(f"\n--- 归档失败详情 (索引: {run_hash_value}) ---\n{fail_log}")
 
-        overall_summary_embed_description += f"\n> 总计归档成功/失败: **{self.succeed_count}** / **{self.fail_count}**\n"
-        if manual: overall_summary_embed_description += f"-# (手动触发)\n"
+        bot_log.info(
+            f"\n--- 运行总结 (索引: {run_hash_value}) ---\n"
+            f"清理前活跃: {current_total_server_threads} -> 清理后预计活跃: {current_total_server_threads - succeed_count}\n"
+            f"总计成功归档: {succeed_count} (超时:{ok_by_reason['inactivity']}, 频道超限:{ok_by_reason['channel_cap']}, 全服挤压:{ok_by_reason['server_cap']})\n"
+            f"总计归档失败: {fail_count} | 总耗时: {total_elapsed:.3f}s"
+        )
 
-        final_embed_color = Color.orange() if self.fail_count > 0 or self.not_found_error_count > 0 else Color.green()
-        if threads_archived_this_run == 0 and kill_count_server_level <=0 :
-             final_embed_color = Color.blue()
+        # --- 步骤 7: 构建增强型监控室 Embed 报告 ---
+        remaining_total = current_total_server_threads - succeed_count
+        headroom_before = 1000 - current_total_server_threads
+        headroom_after = 1000 - remaining_total
 
-        final_embed = Embed(title=f"归档报告: {settings.config_name}", description=overall_summary_embed_description, color=final_embed_color)
-        final_embed.set_author(name=current_run_timestamp_str)
+        desc_lines = []
+        if current_total_server_threads >= 950:
+            desc_lines.append(
+                f"⚠️ **高水位预警**：清理前活跃帖达 **{current_total_server_threads}/1000**（仅余 {headroom_before} 缓冲）！"
+            )
 
-        if self.archive_run_details_for_embed:
-            details_text_parts = []
-            current_length = 0
-            max_field_length = 1000
+        inactivity_rule_str = f"开启 (**{settings.inactivity_days}** 天)" if settings.inactivity_days > 0 else "关闭"
+        channel_rule_str = (
+            f"开启 (**{settings.max_active_posts}** 帖/频道)"
+            if (settings.enable_channel_limit and settings.max_active_posts > 0)
+            else "未启用"
+        )
 
-            for title, desc in self.archive_run_details_for_embed.items():
-                part = f"**{title}**\n{desc}\n"
-                if current_length + len(part) > max_field_length and details_text_parts:
-                    final_embed.add_field(name="部分归档详情", value="".join(details_text_parts), inline=False)
-                    details_text_parts = [part]
-                    current_length = len(part)
+        desc_lines.extend(
+            [
+                f"> **归档策略**：不活跃归档 {inactivity_rule_str} ｜ 全服目标 **{settings.max_active_threads}** ｜ 单频道上限 {channel_rule_str}",
+                f"> **活跃池水位**：**{current_total_server_threads}** ➔ **{remaining_total}** / 1000（当前余量 **{headroom_after}**）",
+                f"> **特殊帖占比**：置顶 **{pinned_server_wide_count}** ｜ 锁定 **{locked_count}** ｜ 黑名单保护 **{blacklisted_thread_count}**"
+                + (f" ｜ 无权限跳过 **{len(no_perm_threads)}**" if no_perm_threads else ""),
+                f"> **本次归档明细**：成功 **{succeed_count}** / 失败 **{fail_count}**"
+                f"（超时归档 **{ok_by_reason['inactivity']}** ｜ 全服挤压 **{ok_by_reason['server_cap']}**"
+                + (f" ｜ 频道超限 **{ok_by_reason['channel_cap']}**" if ok_by_reason["channel_cap"] else "")
+                + "）",
+                f"> **巡检耗时**：**{total_elapsed:.2f}s**（缓存命中 {fetch_stats['cache_hit']} / API拉取 {fetch_stats['api_ok']}）",
+            ]
+        )
+        if manual:
+            desc_lines.append("-# (本次由管理员手动触发)")
+
+        if fail_count > 0 or current_total_server_threads >= 980:
+            embed_color = Color.orange()
+        elif succeed_count > 0:
+            embed_color = Color.green()
+        else:
+            embed_color = Color.blue()
+
+        final_embed = Embed(
+            title=f"归档报告: {settings.config_name}",
+            description="\n".join(desc_lines),
+            color=embed_color,
+        )
+        final_embed.set_author(name=f"{current_run_timestamp_str} | 索引: {run_hash_value}")
+
+        # 字段 A：清理后剩余活跃池健康度（时间分布 + Top 5 频道占比）
+        surviving_infos = [info for info in activity_infos if info.thread.id not in archived_ok_ids]
+        pool_summary_lines = []
+        if surviving_infos:
+            b_24h = b_1_3d = b_3_7d = b_gt7d = 0
+            for info in surviving_infos:
+                age_days = (now_utc - info.last_active_at).total_seconds() / 86400
+                if age_days <= 1:
+                    b_24h += 1
+                elif age_days <= 3:
+                    b_1_3d += 1
+                elif age_days <= 7:
+                    b_3_7d += 1
                 else:
-                    details_text_parts.append(part)
-                    current_length += len(part)
+                    b_gt7d += 1
+            pool_summary_lines.append(
+                f"**可归档活跃帖时间分布**（共 {len(surviving_infos)} 帖）：\n"
+                f"`<24h`: **{b_24h}** ｜ `1~3天`: **{b_1_3d}** ｜ `3~7天`: **{b_3_7d}** ｜ `>7天`: **{b_gt7d}**"
+            )
 
-            if details_text_parts: 
-                 final_embed.add_field(name="部分归档详情 (续)" if final_embed.fields else "部分归档详情", value="".join(details_text_parts), inline=False)
+        # 统计清理后全服所有剩余活跃帖的父频道占比 Top 5
+        surviving_parent_counter: Counter[int] = Counter()
+        for t_obj in all_server_active_threads_list:
+            if t_obj.id not in archived_ok_ids and t_obj.parent_id:
+                surviving_parent_counter[t_obj.parent_id] += 1
 
+        if surviving_parent_counter and remaining_total > 0:
+            top_channels_str = []
+            for pid, cnt in surviving_parent_counter.most_common(5):
+                pct = cnt / remaining_total * 100
+                mark = " *(黑名单)*" if pid in blacklisted_parent_ids else ""
+                top_channels_str.append(f"<#{pid}>: **{cnt}** ({pct:.1f}%){mark}")
+            pool_summary_lines.append("**活跃帖 Top 5 频道**：\n" + " ｜ ".join(top_channels_str))
 
+        if pool_summary_lines:
+            safe_add_embed_field(final_embed, "📊 当前活跃池分布（清理后）", "\n".join(pool_summary_lines), inline=False)
+
+        # 字段 B：本次归档时间跨度与首尾样本（避免只看前 10 个老帖造成误判）
+        if archived_ok_items:
+            oldest_item = archived_ok_items[0][0]
+            newest_item = archived_ok_items[-1][0]
+            oldest_days = (now_utc - oldest_item.info.last_active_at).total_seconds() / 86400
+            newest_days = (now_utc - newest_item.info.last_active_at).total_seconds() / 86400
+            oldest_str = oldest_item.info.last_active_at.strftime("%Y-%m-%d %H:%M")
+            newest_str = newest_item.info.last_active_at.strftime("%Y-%m-%d %H:%M")
+
+            span_header = (
+                f"**最后活跃跨度**：最老 `{oldest_str}` (**{oldest_days:.1f}天前**) "
+                f"➔ 最新 `{newest_str}` (**{newest_days:.1f}天前**)\n"
+            )
+
+            def _fmt_sample(idx: int, plan_item: ArchivePlanItem) -> str:
+                d_ago = (now_utc - plan_item.info.last_active_at).total_seconds() / 86400
+                t_str = plan_item.info.last_active_at.strftime("%m-%d %H:%M")
+                fb = "(无消息按建帖)" if plan_item.info.is_fallback_created_at else ""
+                return f"`#{idx}` {plan_item.info.thread.mention} — `{t_str}` (**{d_ago:.1f}天前**{fb}) [{plan_item.reason_label}]"
+
+            sample_lines = [span_header]
+            total_ok = len(archived_ok_items)
+            if total_ok <= 8:
+                for i, (p_item, _) in enumerate(archived_ok_items, start=1):
+                    sample_lines.append(_fmt_sample(i, p_item))
+            else:
+                sample_lines.append("*▼ 最早未活跃样本（前 4 条）：*")
+                for i in range(4):
+                    sample_lines.append(_fmt_sample(i + 1, archived_ok_items[i][0]))
+                sample_lines.append(f"*... 中间省略 {total_ok - 8} 个归档帖 ...*")
+                sample_lines.append("*▲ 临界线附近最新样本（最后 4 条）：*")
+                for i in range(total_ok - 4, total_ok):
+                    sample_lines.append(_fmt_sample(i + 1, archived_ok_items[i][0]))
+
+            safe_add_embed_field(
+                final_embed, f"🗂️ 本次归档跨度与样本（共 {total_ok} 帖）", "\n".join(sample_lines), inline=False
+            )
+
+        # 字段 C：无管理权限频道提示（帮助管理快速定位应加黑名单或补权限的频道）
+        if no_perm_parent_ids:
+            ch_mentions = ", ".join(f"<#{pid}>" for pid in list(no_perm_parent_ids)[:10])
+            perm_tip = (
+                f"共跳过 **{len(no_perm_threads)}** 个缺少 `管理帖子/查看历史` 权限的活跃子区（涉及频道：{ch_mentions}）。\n"
+                f"-# 如为投诉工单或管理内部频道，可加入 `blacklist_channel_ids`；如需自动归档，请赋予 Bot 管理帖子权限。"
+            )
+            safe_add_embed_field(final_embed, "🔒 权限跳过提示", perm_tip, inline=False)
+
+        # 字段 D：置顶帖消息审计记录
+        if audit_embed_items:
+            audit_lines = [f"**{k}**\n{v}" for k, v in audit_embed_items[:5]]
+            safe_add_embed_field(final_embed, "📌 置顶帖消息审计", "\n".join(audit_lines), inline=False)
+
+        # 发送通知到监控频道
         if settings.notification_thread_id:
             try:
                 notif_channel = await self.fetch_channel(settings.notification_thread_id)
-
                 if isinstance(notif_channel, (TextChannel, Thread)):
-                    await notif_channel.send(embed=final_embed)
+                    sent_msg = await notif_channel.send(embed=final_embed)
+                    settings.last_notice_message_id = sent_msg.id
 
-                    if self.log_get_message_error_details:
-                        error_embed = Embed(title=f"警告: 获取消息出错↓", description=self.log_get_message_error_details[:4000], color=Color.yellow())
+                    if archived_fail_items:
+                        err_desc = "\n".join(embed_err for _, _, embed_err in archived_fail_items[:15])
+                        error_embed = Embed(
+                            title="错误: 部分帖子归档操作失败",
+                            description=err_desc[:4000],
+                            color=Color.red(),
+                        )
                         await notif_channel.send(embed=error_embed)
-
-                    if self.log_archived_error_details:
-                        error_embed = Embed(title=f"错误: 归档操作出错↓", description=self.log_archived_error_details[:4000], color=Color.red())
-                        await notif_channel.send(embed=error_embed)
-
             except Exception as e:
-                bot_log.error(f"发送最终通知到频道 {settings.notification_thread_id} 失败: {e}")
+                bot_log.error(f"发送归档报告到频道 {settings.notification_thread_id} 失败: {e}")
 
-    async def _get_last_message_task(self, thread_list: list[discord.Thread]) -> list[ThreadMessage]:
-        tasks_list = []
+        # 返回当前仍处于活跃状态的帖子 ID 集合，用于维护缓存体积
+        remaining_active_ids = {
+            t_obj.id for t_obj in all_server_active_threads_list if t_obj.id not in archived_ok_ids
+        }
+        return remaining_active_ids
 
-        for thread_to_check in thread_list:
-            task = asyncio.create_task(self._get_last_message(thread_to_check))
-            tasks_list.append(task)
-            await asyncio.sleep(0.05) # 避免速率限制
+    # ---------------- 获取最后活跃时间（带缓存与并发控制） ----------------
+    async def _resolve_threads_last_activity(
+        self, thread_list: list[discord.Thread]
+    ) -> tuple[list[ThreadActivityInfo], dict[str, int], list[str]]:
+        """
+        优先使用 (thread.id, thread.last_message_id) 内存缓存；
+        仅对新增或 last_message_id 发生变化的帖子并发拉取 history(limit=5)。
+        """
+        stats = {
+            "cache_hit": 0,
+            "api_ok": 0,
+            "empty_fallback": 0,
+            "skipped_error": 0,
+        }
+        error_lines: list[str] = []
+        results: list[ThreadActivityInfo] = []
+        to_fetch: list[discord.Thread] = []
 
-        results = await asyncio.gather(*tasks_list)
+        for thread in thread_list:
+            cached = self.thread_activity_cache.get(thread.id)
+            if cached is not None and cached.get("last_message_id") == thread.last_message_id:
+                stats["cache_hit"] += 1
+                results.append(
+                    ThreadActivityInfo(
+                        thread=thread,
+                        last_active_at=datetime.fromtimestamp(cached["last_active_ts"], tz=timezone.utc),
+                        is_fallback_created_at=cached.get("is_fallback", False),
+                        from_cache=True,
+                    )
+                )
+            else:
+                to_fetch.append(thread)
 
-        thread_obj_list = [
-            ThreadMessage(thread, message)
-            for thread, message in zip(thread_list, results)
-            if message is not None
-        ]
-        return thread_obj_list
+        if not to_fetch:
+            return results, stats, error_lines
 
-    async def _get_last_message(self, thread: discord.Thread) -> discord.Message | ErrorMessage:
-        try:
+        sem = asyncio.Semaphore(HISTORY_FETCH_CONCURRENCY)
 
-            async for message_in_history in thread.history(limit=5):
-                if message_in_history:
-                    self.message_succeed_count += 1
-                    return message_in_history
+        async def _fetch_one(t_obj: discord.Thread) -> ThreadActivityInfo | None:
+            async with sem:
+                try:
+                    async for msg in t_obj.history(limit=5):
+                        if msg is not None:
+                            dt = ensure_utc(msg.created_at)
+                            self.thread_activity_cache[t_obj.id] = {
+                                "last_message_id": t_obj.last_message_id,
+                                "last_active_ts": dt.timestamp(),
+                                "is_fallback": False,
+                            }
+                            stats["api_ok"] += 1
+                            return ThreadActivityInfo(
+                                thread=t_obj, last_active_at=dt, is_fallback_created_at=False, from_cache=False
+                            )
 
-            # 如果循环结束没有找到消息
-            self.not_found_error_count += 1
-            error_detail = f"\n  > 帖子 {thread.mention} 中未能找到消息"
+                    # 帖子内所有消息均已被删除，回退使用帖子创建时间并写入缓存避免每轮重复请求
+                    fallback_dt = ensure_utc(t_obj.created_at or discord.utils.snowflake_time(t_obj.id))
+                    self.thread_activity_cache[t_obj.id] = {
+                        "last_message_id": t_obj.last_message_id,
+                        "last_active_ts": fallback_dt.timestamp(),
+                        "is_fallback": True,
+                    }
+                    stats["empty_fallback"] += 1
+                    return ThreadActivityInfo(
+                        thread=t_obj, last_active_at=fallback_dt, is_fallback_created_at=True, from_cache=False
+                    )
 
-            self.log_get_message_error_details += error_detail #
-            bot_log.warning(f"获取帖子 {thread.name} (ID:{thread.id}) 的最后消息失败: history()迭代未返回消息")
-            return ErrorMessage(thread.created_at or datetime.now(timezone.utc))
+                except discord.NotFound:
+                    # 帖子在扫描期间已被删除，直接忽略
+                    self.thread_activity_cache.pop(t_obj.id, None)
+                    return None
+                except discord.Forbidden:
+                    stats["skipped_error"] += 1
+                    error_lines.append(f"  > 帖子 {t_obj.name} (ID:{t_obj.id}) 无权限读取历史消息，已跳过")
+                    return None
+                except Exception as e:
+                    # 网络波动或未知异常：跳过本轮，绝不伪造建帖时间以防误杀热帖
+                    stats["skipped_error"] += 1
+                    error_lines.append(f"  > 帖子 {t_obj.name} (ID:{t_obj.id}) 获取消息异常，本轮跳过: {e}")
+                    return None
 
-        except discord.Forbidden:
-            self.not_found_error_count += 1
-            error_detail = f"\n  > 帖子 {thread.mention} 无权限访问其历史记录"
-            self.log_get_message_error_details += error_detail
-            bot_log.warning(f"获取帖子 {thread.name} (ID:{thread.id}) 的最后消息失败: 无权限(Forbidden)。")
-            return ErrorMessage(thread.created_at or datetime.now(timezone.utc))
+        fetched_list = await asyncio.gather(*(_fetch_one(t) for t in to_fetch))
+        for item in fetched_list:
+            if item is not None:
+                results.append(item)
 
-        except Exception as e:
-            self.not_found_error_count += 1
-            error_detail = f"\n  > 帖子 {thread.mention} 获取其消息时发生错误↙\n{e}"
-            self.log_get_message_error_details += error_detail
-            bot_log.error(f"获取帖子 {thread.name} (ID:{thread.id}) 的最后消息时发生异常: {e}", exc_info=False)
-            return ErrorMessage(thread.created_at or datetime.now(timezone.utc))
+        return results, stats, error_lines
 
-    async def _archive_thread_task(self, thread_obj_list: list[ThreadMessage], settings: GuildArchiveSettings): #
-        tasks_list = []
+    # ---------------- 批量执行归档 ----------------
+    async def _archive_thread_batch(
+        self, plan_items: list[ArchivePlanItem], now_utc: datetime
+    ) -> tuple[list[tuple[ArchivePlanItem, str]], list[tuple[ArchivePlanItem, str, str]]]:
+        """并发执行帖子归档，返回 (成功列表, 失败列表)"""
+        if not plan_items:
+            return [], []
 
-        for tm_obj in thread_obj_list:
-            task = asyncio.create_task(self._archive_thread(tm_obj.thread, tm_obj.last_message, settings)) #
-            tasks_list.append(task)
-            await asyncio.sleep(0.05)
+        sem = asyncio.Semaphore(ARCHIVE_EDIT_CONCURRENCY)
+        ok_results: list[tuple[ArchivePlanItem, str]] = []
+        fail_results: list[tuple[ArchivePlanItem, str, str]] = []
 
-        await asyncio.gather(*tasks_list)
+        async def _do_one(idx: int, item: ArchivePlanItem):
+            thread = item.info.thread
+            last_str = item.info.last_active_at.strftime("%Y-%m-%d %H:%M")
+            hours_ago = (now_utc - item.info.last_active_at).total_seconds() / 3600
 
-    async def _audit_pinned_thread_messages(self, guild: Guild, settings: GuildArchiveSettings, pinned_thread_ids: set[int]) -> str:
-        """审计置顶帖中的漏监听消息"""
-        log_info = f"\n置顶帖消息审计:"
+            async with sem:
+                try:
+                    if not thread.archived:
+                        await thread.edit(archived=True, reason=f"自动归档: {item.reason_label}")
+                    log_line = (
+                        f"  - [{idx}] {thread.name} | ID:{thread.id} | "
+                        f"原因:{item.reason_label} | 最后活跃:{last_str} ({hours_ago:.1f}h前)"
+                    )
+                    ok_results.append((item, log_line))
+                except discord.NotFound:
+                    # 归档前帖子已被作者或版务删除，视为已清理，不计入失败报错
+                    self.thread_activity_cache.pop(thread.id, None)
+                except Exception as e:
+                    log_err = (
+                        f"  - [失败] {thread.name} (ID:{thread.id}) | "
+                        f"原因:{item.reason_label} | 最后活跃:{last_str} | 错误:{e}"
+                    )
+                    embed_err = f"• {thread.mention} (`{thread.id}`) — `{str(e)[:120]}`"
+                    fail_results.append((item, log_err, embed_err))
+                    bot_log.error(f"归档帖子 {thread.name} (ID:{thread.id}) 失败: {e}")
+
+        await asyncio.gather(*(_do_one(idx, item) for idx, item in enumerate(plan_items, start=1)))
+        # 恢复按活跃时间从老到新顺序（并发完成顺序可能微调）
+        ok_results.sort(key=lambda pair: pair[0].info.last_active_at)
+        return ok_results, fail_results
+
+    # ---------------- 置顶帖消息审计 ----------------
+    async def _audit_pinned_thread_messages(
+        self,
+        guild: Guild,
+        settings: GuildArchiveSettings,
+        active_threads: list[discord.Thread],
+        pinned_thread_ids: set[int],
+    ) -> tuple[str, list[tuple[str, str]]]:
+        """审计置顶帖中的漏监听消息（带单轮成员查询缓存）"""
+        log_lines = ["置顶帖消息审计:"]
         deleted_count = 0
         checked_count = 0
-        audit_details = []
-        
-        # 获取所有置顶帖
-        pinned_threads = []
-        for thread_id in pinned_thread_ids:
-            try:
-                thread = guild.get_thread(thread_id)
-                if thread and not thread.locked:  # 只处理非锁定的置顶帖
-                    pinned_threads.append(thread)
-            except Exception as e:
-                bot_log.warning(f"获取置顶帖 {thread_id} 失败: {e}")
-        
-        log_info += f"\n  找到 {len(pinned_threads)} 个非锁定置顶帖进行审计"
-        
+        audit_details: list[tuple[str, str]] = []
+        member_cache: dict[int, discord.Member | None] = {}
+        records_dirty = False
+
+        pinned_threads = [
+            t for t in active_threads if t.id in pinned_thread_ids and not t.locked
+        ]
+        log_lines.append(f"  找到 {len(pinned_threads)} 个非锁定置顶帖进行审计")
+
+        now_utc = datetime.now(timezone.utc)
+        three_days_ago = now_utc - timedelta(days=3)
+
         for thread in pinned_threads:
             try:
                 checked_count += 1
                 current_last_message_id = thread.last_message_id
                 stored_last_message_id = self.pinned_last_messages.get(thread.id)
-                
-                # 如果没有记录或当前ID与记录不一致，说明有新消息
-                if stored_last_message_id is None or current_last_message_id != stored_last_message_id:
-                    log_info += f"\n  [新消息检测] {thread.name} (ID: {thread.id})"
-                    
-                    # 添加到embed详情
-                    audit_key = f"[审计] {thread.name}"
-                    if stored_last_message_id is None:
-                        audit_desc = f"> 首次检测，拉取最新消息进行审计"
-                    else:
-                        audit_desc = f"> 检测到变化，拉取最新消息审计"
-                    
-                    # 拉取最新的一批消息（固定数量）
-                    recent_messages = []
-                    try:
-                        async for message in thread.history(limit=50):
-                            recent_messages.append(message)
-                    except discord.Forbidden:
-                        log_info += f" -> 无权限访问历史记录"
-                        audit_desc += "\n> 无权限访问历史记录"
-                        audit_details.append((audit_key, audit_desc))
-                        continue
-                    except Exception as e:
-                        log_info += f" -> 获取历史记录失败: {e}"
-                        audit_desc += f"\n> 获取历史记录失败: {e}"
-                        audit_details.append((audit_key, audit_desc))
-                        continue
-                    
-                    if recent_messages:
-                        log_info += f" -> 拉取了 {len(recent_messages)} 条最新消息"
-                        audit_desc += f"\n> 拉取了 {len(recent_messages)} 条最新消息"
-                        
-                        # 筛选需要删除的消息（3天内的消息）
-                        now_utc = datetime.now(timezone.utc)
-                        three_days_ago = now_utc - timedelta(days=3)
-                        
-                        deleted_messages_info = []
-                        processed_count = 0
-                        for message in recent_messages:
-                            # 检查消息时间是否在3天内
-                            if message.created_at < three_days_ago:
-                                continue
-                            
-                            processed_count += 1
-                            
-                            # 检查用户是否在白名单中
-                            author = message.author
-                            
-                            if self._is_user_exempt(author, thread, settings):
-                                continue
 
-                            # 历史消息可能只有 User，先查询成员身份再判断角色豁免。
-                            if not isinstance(author, discord.Member):
-                                try:
-                                    author = await guild.fetch_member(author.id)
-                                except discord.HTTPException as e:
-                                    bot_log.warning(
-                                        f"无法确认用户 {author.id} 的成员权限，跳过删除消息 {message.id}: {e}"
-                                    )
-                                    continue
-                                if self._is_user_exempt(author, thread, settings):
-                                    continue
-                            
-                            # 删除消息
+                if stored_last_message_id is not None and current_last_message_id == stored_last_message_id:
+                    continue
+
+                log_lines.append(f"  [新消息检测] {thread.name} (ID: {thread.id})")
+                audit_key = f"[审计] {thread.name}"
+                audit_desc_lines = [
+                    "> 首次检测，拉取最新消息审计" if stored_last_message_id is None else "> 检测到新消息，拉取审计"
+                ]
+
+                recent_messages: list[discord.Message] = []
+                try:
+                    async for message in thread.history(limit=50):
+                        recent_messages.append(message)
+                except discord.Forbidden:
+                    log_lines.append("    -> 无权限访问历史记录")
+                    audit_desc_lines.append("> 无权限访问历史记录")
+                    audit_details.append((audit_key, "\n".join(audit_desc_lines)))
+                    continue
+                except Exception as e:
+                    log_lines.append(f"    -> 获取历史记录失败: {e}")
+                    audit_desc_lines.append(f"> 获取历史记录失败: {e}")
+                    audit_details.append((audit_key, "\n".join(audit_desc_lines)))
+                    continue
+
+                deleted_this_thread = 0
+                for message in recent_messages:
+                    if message.author.bot or ensure_utc(message.created_at) < three_days_ago:
+                        continue
+
+                    author = message.author
+                    if self._is_user_exempt(author, thread, settings):
+                        continue
+
+                    if not isinstance(author, discord.Member):
+                        if author.id not in member_cache:
                             try:
-                                await message.delete()
-                                deleted_count += 1
-                                log_info += f"\n    [已删除] 用户 {author.name} 的消息 (ID: {message.id})"
-                                deleted_messages_info.append(f"用户 {author.name} 的消息 (ID: {message.id})")
-                            except discord.Forbidden:
-                                log_info += f"\n    [删除失败] 无权限删除消息 (ID: {message.id})"
-                                deleted_messages_info.append(f"无权限删除消息 (ID: {message.id})")
+                                member_cache[author.id] = await guild.fetch_member(author.id)
                             except discord.NotFound:
-                                # 消息可能已经被删除
-                                pass
-                            except Exception as e:
-                                log_info += f"\n    [删除失败] 消息 {message.id}: {e}"
-                                deleted_messages_info.append(f"删除失败: {message.id} ({e})")
-                        
-                        if processed_count > 0:
-                            audit_desc += f"\n> 检查了 {processed_count} 条3天内消息"
-                        if deleted_messages_info:
-                            deleted_lines = "\n> ".join(deleted_messages_info)
-                            audit_desc += "\n> 删除操作: " + deleted_lines
-                    
-                    # 更新最后消息ID记录
-                    if current_last_message_id:
-                        self.pinned_last_messages[thread.id] = current_last_message_id
-                        await self._save_pinned_last_messages()
-                        log_info += f" -> 已更新最后消息ID: {current_last_message_id}"
-                        audit_desc += f"\n> 已更新最后消息ID: {current_last_message_id}"
-                    
-                    audit_details.append((audit_key, audit_desc))
-                
+                                member_cache[author.id] = None
+                            except discord.HTTPException as e:
+                                bot_log.warning(f"无法确认用户 {author.id} 成员权限，跳过消息 {message.id}: {e}")
+                                continue
+                        fetched_member = member_cache[author.id]
+                        if fetched_member is not None and self._is_user_exempt(fetched_member, thread, settings):
+                            continue
+
+                    try:
+                        await message.delete()
+                        deleted_count += 1
+                        deleted_this_thread += 1
+                        log_lines.append(f"    [已删除] 用户 {author.name} 的消息 (ID: {message.id})")
+                    except discord.Forbidden:
+                        log_lines.append(f"    [删除失败] 无权限删除消息 (ID: {message.id})")
+                    except discord.NotFound:
+                        pass
+                    except Exception as e:
+                        log_lines.append(f"    [删除失败] 消息 {message.id}: {e}")
+
+                if deleted_this_thread > 0:
+                    audit_desc_lines.append(f"> 已清理 {deleted_this_thread} 条非豁免消息")
+                    audit_details.append((audit_key, "\n".join(audit_desc_lines)))
+
+                if current_last_message_id:
+                    self.pinned_last_messages[thread.id] = current_last_message_id
+                    records_dirty = True
+
             except Exception as e:
-                log_info += f"\n  [审计失败] 处理 {thread.name} 时发生错误: {e}"
-                audit_key = f"[审计失败] {thread.name}"
-                audit_desc = f"> 处理时发生错误: {e}"
-                audit_details.append((audit_key, audit_desc))
-        
-        # 将审计详情添加到embed字段
-        for audit_key, audit_desc in audit_details:
-            if len(self.archive_run_details_for_embed) < 10:
-                self.archive_run_details_for_embed[audit_key] = audit_desc
-        
-        log_info += f"\n  审计完成: 检查了 {checked_count} 个置顶帖，删除了 {deleted_count} 条消息"
-        return log_info
+                log_lines.append(f"  [审计失败] 处理 {thread.name} 时发生错误: {e}")
 
-    async def _archive_thread(self, thread: discord.Thread, last_msg_obj: discord.Message | ErrorMessage, settings: GuildArchiveSettings):
-        archive_reason = f"自动归档"
+        if records_dirty:
+            await self._save_pinned_last_messages()
 
-        if isinstance(last_msg_obj, ErrorMessage):
-            created_at_str = thread.created_at.strftime('%Y-%m-%d %H:%M') if thread.created_at else "未知时间"
-            last_message_time_str = f"未知(帖子创建于 {created_at_str})"
-            hours_diff_str = "未知"
+        log_lines.append(f"  审计完成: 检查了 {checked_count} 个置顶帖，删除了 {deleted_count} 条消息")
+        return "\n".join(log_lines), audit_details
 
-        else:
-            last_message_time_str = last_msg_obj.created_at.strftime('%Y-%m-%d %H:%M')
-            now_utc = datetime.now(timezone.utc)
-            time_diff = now_utc - last_msg_obj.created_at
-            hours_diff = time_diff.total_seconds() / 3600
-            hours_diff_str = f"{hours_diff:.2f} 小时前"
-            days_diff = time_diff.total_seconds() / 86400
-            days_diff_str = f"{days_diff:.2f} 天前"
-
-        archive_category = None
-        if settings.archive_category_id:
-            archive_category = thread.guild.get_channel(settings.archive_category_id)
-            if not isinstance(archive_category, CategoryChannel):
-                archive_category = None
-
-        try:
-            action_taken = False
-            start_time = time.time()
-
-            # 实际归档操作
-            if not thread.archived:
-                await thread.edit(archived=True, reason=archive_reason)
-                action_taken = True
-
-            if action_taken or thread.archived:
-                self.succeed_count += 1
-                log_line = f"\n  - [{self.succeed_count}] {thread.name} | {thread.id} | 最后活跃时间: {last_message_time_str} ({hours_diff_str})"
-                self.log_archived_info_details += log_line
-
-                embed_title_key = f"[T{self.succeed_count}] 归档成功↓"
-                embed_value_desc = f"> {thread.mention}\n> 最后活跃时间: {last_message_time_str} ({days_diff_str})"
-
-                if len(self.archive_run_details_for_embed) < 10:
-                    self.archive_run_details_for_embed[embed_title_key] = embed_value_desc #
-
-        except Exception as e:
-            self.fail_count += 1
-            log_line = f"\n  - [E{self.fail_count}] {thread.name} (ID:{thread.id}) | 最后一条消息: {last_message_time_str} ({hours_diff_str}) | 错误: {e}"
-            self.log_archived_error_details += log_line
-            embed_title_key = f"[E{self.fail_count}] 归档失败"
-            embed_value_desc = f"- ID:{thread.id} {thread.mention}\n- 最后一条消息: {last_message_time_str} ({hours_diff_str})\n- 错误: {str(e)[:100]}"
-
-            if len(self.archive_run_details_for_embed) < 10:
-                 self.archive_run_details_for_embed[embed_title_key] = embed_value_desc
-
-            bot_log.error(f"归档帖子 {thread.name} (ID:{thread.id}) 失败: {e}", exc_info=False)
 
 # --- 命令管理 ---
 class ArchiveManagerCog(commands.Cog):
     def __init__(self, bot: ThreadArchiverBot):
         self.bot = bot
 
-    @app_commands.command(name="set-archive-rules", description="设置当前服务器的归档规则（不活跃天数、活跃帖数量等）。")
+    async def _config_name_autocomplete(
+        self, interaction: discord.Interaction, current: str
+    ) -> list[app_commands.Choice[str]]:
+        choices = []
+        for setting in self.bot.guild_settings_map.values():
+            if current.lower() in setting.config_name.lower():
+                choices.append(app_commands.Choice(name=setting.config_name, value=setting.config_name))
+        return choices[:25]
+
+    @app_commands.command(name="set-archive-rules", description="修改服务器归档规则（仅需填写要更改的参数，未填项保持不变）。")
     @app_commands.describe(
-        config_name="在环境变量 GUILD_CONFIGS_JSON 中定义的服务器配置名",
-        inactivity_days="帖子多少天不活跃后自动归档 (0 表示关闭按天归档)",
-        max_active_posts="频道内最大活跃帖子数上限 (0 表示不限制；当前仍未在逻辑中使用，仅预留)",
-        max_active_threads="整个服务器允许的最大活跃帖子数上限"
+        config_name="在 GUILD_CONFIGS_JSON 中定义的服务器配置名",
+        inactivity_days="多少天无发言自动归档（0 表示关闭按天归档）",
+        max_active_threads="整个服务器允许的最大活跃帖子数目标（建议设为 750~850 留出缓冲）",
+        max_active_posts="单频道最大活跃帖子数（需配合 enable_channel_limit 开启）",
+        enable_channel_limit="是否启用单频道最大活跃帖子数限制",
     )
+    @app_commands.autocomplete(config_name=_config_name_autocomplete)
     @app_commands.default_permissions(manage_guild=True)
     @app_commands.guild_only()
     @app_commands.checks.has_permissions(manage_guild=True)
-    async def set_archive_rules_cmd(self, interaction: discord.Interaction,
-                                    config_name: str, inactivity_days: int, max_active_posts: int, max_active_threads: int):
+    async def set_archive_rules_cmd(
+        self,
+        interaction: discord.Interaction,
+        config_name: str,
+        inactivity_days: int | None = None,
+        max_active_threads: int | None = None,
+        max_active_posts: int | None = None,
+        enable_channel_limit: bool | None = None,
+    ):
         await interaction.response.defer(ephemeral=True)
 
         target_setting: GuildArchiveSettings | None = None
@@ -1020,25 +1258,39 @@ class ArchiveManagerCog(commands.Cog):
                 break
 
         if not target_setting or not guild_id_to_update:
-            await interaction.followup.send(f"错误：未找到名为 '{config_name}' 的服务器配置。", ephemeral=True)
+            await interaction.followup.send(f"错误：未找到名为 `{config_name}` 的服务器配置。", ephemeral=True)
             return
 
-        target_setting.inactivity_days = inactivity_days if inactivity_days >= 0 else target_setting.inactivity_days
-        target_setting.max_active_posts = max_active_posts if max_active_posts >= 0 else target_setting.max_active_posts
+        if inactivity_days is not None and inactivity_days >= 0:
+            target_setting.inactivity_days = inactivity_days
+        if max_active_threads is not None and max_active_threads >= 0:
+            target_setting.max_active_threads = max_active_threads
+        if max_active_posts is not None and max_active_posts >= 0:
+            target_setting.max_active_posts = max_active_posts
+        if enable_channel_limit is not None:
+            target_setting.enable_channel_limit = enable_channel_limit
 
         await self.bot.save_guild_setting(guild_id_to_update)
 
-        embed = Embed(title="归档规则已更新", color=Color.green())
+        channel_limit_desc = (
+            f"已启用 (**{target_setting.max_active_posts}** 帖/频道)"
+            if (target_setting.enable_channel_limit and target_setting.max_active_posts > 0)
+            else f"未启用 (预留值: {target_setting.max_active_posts})"
+        )
+
+        embed = Embed(title="✅ 归档规则已更新", color=Color.green())
         embed.description = (
-            f"服务器配置 **{config_name}** 的规则已更新：\n"
-            f"- 不活跃归档天数: **{target_setting.inactivity_days if target_setting.inactivity_days > 0 else '未启用'}** 天\n"
-            f"- 最大活跃帖子数: **{target_setting.max_active_posts if target_setting.max_active_posts > 0 else '未启用'}**"
+            f"服务器配置 **{config_name}** 当前生效规则：\n"
+            f"- 不活跃归档天数: **{f'{target_setting.inactivity_days} 天' if target_setting.inactivity_days > 0 else '未启用'}**\n"
+            f"- 全服最大活跃帖目标: **{target_setting.max_active_threads if target_setting.max_active_threads > 0 else '未启用'}**\n"
+            f"- 单频道活跃帖上限: **{channel_limit_desc}**"
         )
         await interaction.followup.send(embed=embed, ephemeral=True)
-        bot_log.info(f"用户 {interaction.user} 更新了 '{config_name}' 的归档规则。")
+        bot_log.info(f"用户 {interaction.user} 更新了 '{config_name}' 的归档规则: {target_setting.to_dict()}")
 
-    @app_commands.command(name="manual-guild-archive", description="手动触发一次归档审计（服务器级 + 不活跃检查）。")
+    @app_commands.command(name="manual-guild-archive", description="手动触发一次归档审计（不活跃归档 + 容量控制）。")
     @app_commands.describe(config_name="在 GUILD_CONFIGS_JSON 中配置的服务器别名")
+    @app_commands.autocomplete(config_name=_config_name_autocomplete)
     @app_commands.default_permissions(manage_guild=True)
     @app_commands.guild_only()
     @app_commands.checks.has_permissions(manage_guild=True)
@@ -1055,12 +1307,12 @@ class ArchiveManagerCog(commands.Cog):
                 break
 
         if not target_setting or not guild_id_to_process:
-            await interaction.followup.send(f"错误：未找到名为 '{config_name}' 的服务器配置。", ephemeral=True)
+            await interaction.followup.send(f"错误：未找到名为 `{config_name}` 的服务器配置。", ephemeral=True)
             return
 
         guild = self.bot.get_guild(guild_id_to_process)
         if not guild:
-            await interaction.followup.send(f"错误：机器人当前无法访问服务器ID {guild_id_to_process}。", ephemeral=True)
+            await interaction.followup.send(f"错误：机器人当前无法访问服务器 ID `{guild_id_to_process}`。", ephemeral=True)
             return
 
         if self.bot.operation_lock.locked():
@@ -1069,67 +1321,76 @@ class ArchiveManagerCog(commands.Cog):
 
         async with self.bot.operation_lock:
             bot_log.info(f"用户 {interaction.user} 手动触发对 '{config_name}' 的归档。")
-            await interaction.followup.send(f"正在开始对服务器配置 '{config_name}' (服务器: {guild.name}) 进行手动归档检查...", ephemeral=True)
+            await interaction.followup.send(
+                f"正在开始对服务器配置 `{config_name}` (服务器: {guild.name}) 进行手动归档检查...", ephemeral=True
+            )
             await self.bot.process_guild_threads(guild, target_setting, manual=True)
-            await interaction.edit_original_response(content=f"对服务器配置 '{config_name}' 的手动归档检查已完成。详情请查看通知频道。")
+            await interaction.edit_original_response(
+                content=f"✅ 对服务器配置 `{config_name}` 的手动归档检查已完成，详情请查看监控通知频道。"
+            )
 
     @app_commands.command(name="view-guild-config", description="查看已加载的服务器归档配置。")
     @app_commands.describe(config_name="在 GUILD_CONFIGS_JSON 中定义的服务器配置名（留空查看所有）")
+    @app_commands.autocomplete(config_name=_config_name_autocomplete)
     @app_commands.guild_only()
     async def view_guild_config_cmd(self, interaction: discord.Interaction, config_name: str | None = None):
         await interaction.response.defer(ephemeral=True)
         embeds_to_send = []
 
         if config_name:
-            found_setting: GuildArchiveSettings | None = None
-            for setting in self.bot.guild_settings_map.values():
-                if setting.config_name == config_name:
-                    found_setting = setting
-                    break
-
+            found_setting = next(
+                (s for s in self.bot.guild_settings_map.values() if s.config_name == config_name), None
+            )
             if not found_setting:
-                await interaction.followup.send(f"未找到名为 '{config_name}' 的服务器配置。", ephemeral=True)
+                await interaction.followup.send(f"未找到名为 `{config_name}` 的服务器配置。", ephemeral=True)
                 return
-
             settings_list = [found_setting]
-
         else:
             settings_list = list(self.bot.guild_settings_map.values())
-
             if not settings_list:
                 await interaction.followup.send("当前没有已加载的服务器配置。", ephemeral=True)
                 return
 
         for setting in settings_list:
             embed = Embed(title=f"配置: {setting.config_name}", color=Color.blue())
-            embed.add_field(name="服务器ID", value=str(setting.guild_id), inline=False)
-            embed.add_field(name="黑名单频道ID", value=", ".join(map(str, setting.blacklist_channel_ids)) or "未设置", inline=False)
-            embed.add_field(name="归档分类ID", value=str(setting.archive_category_id) if setting.archive_category_id else "未设置", inline=False)
+            embed.add_field(name="服务器 ID", value=str(setting.guild_id), inline=True)
+            embed.add_field(name="巡检间隔", value=f"{AUDIT_INTERVAL_MINUTES} 分钟", inline=True)
+            embed.add_field(
+                name="黑名单频道 ID",
+                value=", ".join(f"`{cid}`" for cid in setting.blacklist_channel_ids) or "未设置",
+                inline=False,
+            )
 
             inactivity_days_str = f"{setting.inactivity_days} 天" if setting.inactivity_days > 0 else "未启用"
-            max_posts_str = str(setting.max_active_posts) if setting.max_active_posts > 0 else "未启用"
-            max_active_threads = str(setting.max_active_threads) if setting.max_active_threads > 0 else "未启用"
+            max_active_threads_str = str(setting.max_active_threads) if setting.max_active_threads > 0 else "未启用"
+            channel_limit_str = (
+                f"已启用 ({setting.max_active_posts} 帖)"
+                if (setting.enable_channel_limit and setting.max_active_posts > 0)
+                else "未启用"
+            )
 
-            embed.add_field(name="不活跃天数", value=inactivity_days_str, inline=True)
-            embed.add_field(name="最大活跃帖数", value=max_posts_str, inline=True)
-            embed.add_field(name="服务器最大活跃帖数", value=max_active_threads, inline=True)
-            embed.add_field(name="通知频道/帖子ID", value=str(setting.notification_thread_id) if setting.notification_thread_id else "未设置", inline=False)
+            embed.add_field(name="不活跃归档天数", value=inactivity_days_str, inline=True)
+            embed.add_field(name="服务器活跃帖目标", value=max_active_threads_str, inline=True)
+            embed.add_field(name="单频道活跃帖上限", value=channel_limit_str, inline=True)
+            embed.add_field(
+                name="通知频道/帖子 ID",
+                value=f"<#{setting.notification_thread_id}> (`{setting.notification_thread_id}`)"
+                if setting.notification_thread_id
+                else "未设置",
+                inline=False,
+            )
 
             if setting.last_notice_message_id:
-                embed.add_field(name="上次通知消息ID", value=str(setting.last_notice_message_id), inline=False)
+                embed.add_field(name="上次通知消息 ID", value=str(setting.last_notice_message_id), inline=False)
             embeds_to_send.append(embed)
 
-        if embeds_to_send:
-            for i in range(0, len(embeds_to_send), 10):
-                await interaction.followup.send(embeds=embeds_to_send[i:i+10], ephemeral=True)
-        else:
-            await interaction.followup.send("未能生成配置信息。",ephemeral=True)
+        for i in range(0, len(embeds_to_send), 10):
+            await interaction.followup.send(embeds=embeds_to_send[i : i + 10], ephemeral=True)
+
 
 # --- 主程序入口 ---
 def main_bot_runner():
     bot = ThreadArchiverBot()
-
-    # 优先从环境变量读取 BOT_TOKEN（由 .env 提供）
     bot.bot_token = os.environ.get("BOT_TOKEN")
 
     if not bot.bot_token:
@@ -1139,11 +1400,12 @@ def main_bot_runner():
     try:
         bot.run(bot.bot_token)
     except discord.LoginFailure:
-        bot_log.critical("Discord登录失败：无效的Token。")
+        bot_log.critical("Discord 登录失败：无效的 Token。")
     except Exception as e:
         bot_log.critical(f"机器人运行时发生致命错误: {e}", exc_info=True)
     finally:
         bot_log.info("机器人已关闭。")
+
 
 if __name__ == "__main__":
     main_bot_runner()
